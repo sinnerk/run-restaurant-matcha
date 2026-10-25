@@ -2,6 +2,12 @@
 
 > **Executor:** Matcha LuaVM · **Version:** v3.0 · **Game:** Run a Restaurant! (Roblox · Place ID 121042)
 
+> [!WARNING]
+> **This README is not accurate and the script it describes is not in this repo.**
+> It is written against `UI.AddTab` / `UI.GetValue` / `remote:FireServer`, none of which
+> exist in Matcha. Read [`docs/STATUS.md`](docs/STATUS.md) and
+> [`docs/MATCHA-API.md`](docs/MATCHA-API.md) before writing any code from this file.
+
 ---
 
 ## ⚡ Quick Start
