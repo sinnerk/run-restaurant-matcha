@@ -5,14 +5,16 @@ Last verified: 2026-10-25.
 ## What is actually in this repo
 
 ```
-README.md          ← design doc for a v3.0 that does not exist on disk
-docs/MATCHA-API.md ← verified Matcha API surface
-.githooks/         ← pre-commit guard against secrets / personal paths
-tools/             ← guard setup + history scanner
+RunRestaurant_Matcha.lua  ← v3.0, 22 KB — added 2026-10-25 from the Downloads copy
+README.md                 ← design doc for that v3.0
+docs/MATCHA-API.md        ← verified Matcha API surface
+.githooks/                ← pre-commit guard against secrets / personal paths
+tools/                    ← guard setup + history scanner
 ```
 
-**`RunRestaurant_Matcha.lua` is not here.** The README describes it as the main script and
-says to paste it into Matcha, but it was never committed. There is nothing to run.
+The script is the **v3.0** build (`RunRestaurant_Matcha_6.lua` on disk, byte-identical,
+SHA-256 `2C625E3C…F082D`). It parses as Lua 5.1 and contains no secrets or personal
+paths, but see the next section before running it.
 
 ## The README describes a build that cannot run
 
