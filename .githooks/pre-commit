@@ -1,0 +1,72 @@
+#!/bin/sh
+# Pre-commit guard for a PUBLIC repo.
+# Blocks staged content that could leak secrets or identify the machine/owner.
+# Bypass deliberately with:  git commit --no-verify
+
+set -u
+
+RED=''
+if [ -t 1 ]; then RED=$(printf '\033[31m'); fi
+OFF=''
+if [ -t 1 ]; then OFF=$(printf '\033[0m'); fi
+
+fail=0
+
+# report <label> <pattern> [allowlist-regex]
+report() {
+    label=$1
+    pattern=$2
+    allow=${3:-}
+    # The guard scripts necessarily contain the patterns they look for.
+    hits=$(git grep --cached -n -I -E "$pattern" -- . \
+        ':(exclude).githooks/*' ':(exclude)tools/scan-history.ps1' 2>/dev/null || true)
+    if [ -n "$allow" ] && [ -n "$hits" ]; then
+        hits=$(printf '%s\n' "$hits" | grep -E -v "$allow" || true)
+    fi
+    if [ -n "$hits" ]; then
+        printf '%s\n' "$RED" "  [blocked] $label" "$OFF"
+        printf '%s\n' "$hits" | sed 's/^/      /' | cut -c1-200
+        fail=1
+    fi
+}
+
+# --- hard identifiers -------------------------------------------------------
+# Absolute Windows home paths: C:\Users\<name>\...
+report "absolute Windows user path" \
+    '[A-Za-z]:[\\/]+Users[\\/]+[A-Za-z0-9._-]+'
+
+# Absolute macOS / Linux home paths, ignoring obvious placeholder names.
+report "absolute home path (/Users or /home)" \
+    '/(Users|home)/[A-Za-z0-9._-]+' \
+    '/(Users|home)/(user|username|you|your-?name|name|example|someone|<[^>]*>)'
+
+# --- credentials ------------------------------------------------------------
+report "Roblox session cookie" 'ROBLOSECURITY'
+
+report "Discord webhook URL" 'discord(app)?\.com/api/webhooks'
+
+report "hard-coded API token" \
+    'ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9]{24,}|xox[baprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}'
+
+report "private key block" 'BEGIN [A-Z ]*PRIVATE KEY'
+
+# --- personal data ----------------------------------------------------------
+report "email address" \
+    '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}' \
+    '(users\.noreply\.github\.com|example\.(com|org|net)|@matcha|noreply@)'
+
+# --- size guard -------------------------------------------------------------
+big=$(git diff --cached --numstat --diff-filter=ACMR | awk '$1 + 0 > 2097152 { print $3 }')
+if [ -n "$big" ]; then
+    printf '%s\n' "$RED" "  [blocked] staged file larger than 2 MB (dumps belong outside the repo)" "$OFF"
+    printf '%s\n' "$big" | sed 's/^/      /'
+    fail=1
+fi
+
+if [ "$fail" -ne 0 ]; then
+    printf '%s\n' "$RED" "" "Commit blocked by .githooks/pre-commit." "$OFF" \
+        "Fix or remove the lines above, or bypass with: git commit --no-verify"
+    exit 1
+fi
+
+exit 0

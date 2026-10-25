@@ -1,0 +1,36 @@
+# ---------- never commit: this repo is PUBLIC ----------
+
+# Matcha workspace dumps / generated diagnostics
+*REMOTE SCANNER*.txt
+runrestaurant_*.json
+runrestaurant_*.log
+matcha_config.json
+*.cfg
+*.dat
+*.ini
+
+# auth caches / keys
+**/auth/
+*_cache.json
+msa_code.json
+*.pem
+*.key
+.env
+.env.*
+
+# dependencies
+node_modules/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# junk
+*.log
+*.tmp
+*.db
+dist_tmp/
+build/
+Thumbs.db
+desktop.ini
+.DS_Store

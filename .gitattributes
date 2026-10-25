@@ -1,0 +1,7 @@
+* text=auto
+
+# Hook scripts must keep LF endings or sh refuses the shebang line.
+.githooks/* text eol=lf
+*.ps1 text eol=crlf
+*.lua text eol=lf
+*.md text eol=lf
