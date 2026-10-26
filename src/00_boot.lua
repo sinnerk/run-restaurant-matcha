@@ -13,7 +13,7 @@ if type(RR) ~= "table" then
   _G.RR = RR
 end
 
-RR.VERSION  = "5.0.0"
+RR.VERSION  = "5.1.0"
 RR.NAME     = "Run a Restaurant! toolkit"
 RR.STARTED  = tick()
 RR.FEATURES = RR.FEATURES or {}
@@ -299,6 +299,82 @@ end
 
 function Util.contains(haystack, needle)
   return string.find(string.lower(haystack), string.lower(needle), 1, true) ~= nil
+end
+
+-- camera viewport, with a sane fallback so callers never nil-index
+function Util.viewport()
+  local ws = svc("Workspace")
+  if not ws then return Vector2.new(1280, 720) end
+  local cam = nil
+  pcall(function() cam = ws.CurrentCamera end)
+  if not cam then return Vector2.new(1280, 720) end
+  local vp = nil
+  pcall(function() vp = cam.ViewportSize end)
+  if vp then return vp end
+  return Vector2.new(1280, 720)
+end
+
+-- world -> screen, nil when behind the camera or the projection failed.
+-- WorldToScreen returns (Vector2, bool) so both results matter.
+function Util.project(pos)
+  if not pos then return nil end
+  local sp, onScreen = nil, false
+  local ok = pcall(function() sp, onScreen = WorldToScreen(pos) end)
+  if not ok or onScreen ~= true or not sp then return nil end
+  return sp
+end
+
+-- pixel distance from the centre of the screen; math.huge when off-screen.
+-- lower means "closer to where the camera is looking", which is how
+-- Roblox picks which of several in-range prompts is the visible one.
+function Util.focusScore(pos)
+  local sp = Util.project(pos)
+  if not sp then return math.huge end
+  local vp = Util.viewport()
+  local dx = sp.X - (vp.X / 2)
+  local dy = sp.Y - (vp.Y / 2)
+  return math.sqrt(dx * dx + dy * dy)
+end
+
+-- ---------------------------------------------------------------------
+-- GUI geometry
+-- ---------------------------------------------------------------------
+-- A button is only really clickable when every ancestor is visible and
+-- its ScreenGui is enabled. Reading .Visible on the button alone reports
+-- every hidden menu in PlayerGui as clickable, and then the click lands
+-- on whatever is behind it.
+function Util.guiShown(obj)
+  if not obj then return false end
+  local cur = obj
+  for _ = 1, 32 do
+    local vis, en, cls, parent = nil, nil, nil, nil
+    pcall(function()
+      vis = cur.Visible
+      en = cur.Enabled
+      cls = cur.ClassName
+      parent = cur.Parent
+    end)
+
+    if vis == false then return false end
+    if en == false then return false end
+    if cls == "PlayerGui" or parent == nil then return true end
+    cur = parent
+  end
+  return false
+end
+
+-- centre of a GuiObject, in the same pixel space as mousemoveabs and
+-- Camera.ViewportSize. AbsolutePosition/AbsoluteSize are already
+-- resolved to pixels by the engine, so no UDim2 arithmetic is needed.
+function Util.guiCenter(obj)
+  local ap, as = nil, nil
+  pcall(function()
+    ap = obj.AbsolutePosition
+    as = obj.AbsoluteSize
+  end)
+  if not ap or not as then return nil end
+  if as.X <= 1 or as.Y <= 1 then return nil end
+  return Vector2.new(ap.X + (as.X / 2), ap.Y + (as.Y / 2))
 end
 
 RR.log("boot ok - " .. RR.VERSION)

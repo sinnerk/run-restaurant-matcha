@@ -9,6 +9,13 @@ matcha_config.json
 *.dat
 *.ini
 
+# decompiled game source — copyright, and derived findings are what we keep.
+# tools/DumpScripts.lua writes these next to the Matcha workspace.
+/scripts/
+/diagnostics/scripts/
+diagnostics/*.lua
+tests/.build/
+
 # auth caches / keys
 **/auth/
 *_cache.json

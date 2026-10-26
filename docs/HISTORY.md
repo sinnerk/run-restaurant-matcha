@@ -37,6 +37,30 @@ docs instead of trusting a hand-written summary.
 5. **Honest scope.** Eight jobs with confirmed names ship; restaurant logic does not,
    because the place shows no cooking prompts and no cook remote. See `GAME-MODEL.md`.
 
+## What v5.1 changed
+
+The v5.0.0 build had a bug that would have made every prompt press miss: it read
+`Enum.KeyCode.Value` and passed it to `keypress`, but Roblox KeyCodes are ASCII-flavoured
+(`E = 101`) while the OS wants virtual-key codes (`E = 0x45`). Every press landed on the
+numpad. That bug is the reason this version exists, and it is the reason the code is now
+executed rather than reviewed:
+
+1. **`12_keymap`** translates `Enum.KeyCode` → VK and is unit-tested against every letter,
+   digit, arrow and function key.
+2. **`tests/` + `run-tests.ps1`** run the real modules in a real Luau VM (44 assertions).
+   Parsing was never proof; now arithmetic, exclusivity and click routing are checked.
+3. **Activation is observed.** `Act.watch` connects to `ProximityPromptService` when the
+   build exposes it, so "the prompt triggered" replaces "the key was pressed".
+4. **Exclusivity is respected.** A press is spent on the prompt the camera has selected, and
+   `strict` mode refuses to press when a neighbour would win.
+5. **The camera drag is held** across a walk instead of pressed and released every frame.
+6. **GUI buttons became a first-class surface.** `PlayerGui` is scannable and clickable at
+   `AbsolutePosition + AbsoluteSize/2`, which reaches every menu-driven system the workspace
+   scan could not see.
+7. **`tools/DumpScripts.lua`** decompiles the client's own scripts and extracts names, keys
+   and classes — the fastest route to the restaurant logic that `GAME-MODEL.md` still lists
+   as unknown.
+
 ## Decisions on record
 
 - **This repo owns the code.** `roblox-matcha-autofarm` is frozen at v4.2.0 as a reference.

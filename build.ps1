@@ -7,6 +7,7 @@ Set-Location $root
 $order = @(
   '00_boot.lua'
   '10_caps.lua'
+  '12_keymap.lua'
   '15_input.lua'
   '20_move.lua'
   '25_world.lua'

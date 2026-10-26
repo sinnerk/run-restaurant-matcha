@@ -54,6 +54,7 @@ function RR.dumpReport()
   lines[#lines + 1] = ""
   lines[#lines + 1] = "== interaction =="
   lines[#lines + 1] = RR.Act.summary()
+  lines[#lines + 1] = "activation  : " .. RR.Act.watchSummary()
   lines[#lines + 1] = RR.Input.summary()
   lines[#lines + 1] = ""
   lines[#lines + 1] = "== jobs =="
@@ -90,6 +91,7 @@ local function buildUI()
   UI.addLabel(function() return "world   : " .. W.summary() end)
   UI.addLabel(function() return "move    : " .. RR.Move.summary() end)
   UI.addLabel(function() return "interact: " .. RR.Act.summary() end)
+  UI.addLabel(function() return "prompts : " .. RR.Act.watchSummary() end)
   UI.addLabel(function() return "input   : " .. RR.Input.summary() end)
   UI.addLabel(function()
     local d = Jobs.Stats
@@ -140,6 +142,7 @@ function RR.stop()
   RR.stopped = true
   Jobs.paused = true
   pcall(function() RR.Move.stop() end)
+  pcall(function() RR.Act.unwatch() end)
   pcall(function() RR.Input.releaseAll() end)
   pcall(function() RR.Cfg.save() end)
   pcall(function() RR.Log.flush() end)
@@ -158,6 +161,11 @@ local function boot()
 
   pcall(function() RR.Caps.probe() end)
   pcall(function() W.scan() end)
+
+  -- Observe ProximityPromptService before the first press. When the
+  -- executor exposes it, "which prompt is active" and "did the press
+  -- land" stop being heuristics and become events.
+  pcall(function() RR.Act.watch() end)
 
   buildUI()
 

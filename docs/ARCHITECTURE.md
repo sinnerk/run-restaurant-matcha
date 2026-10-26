@@ -27,11 +27,12 @@ Concretely, that removes four things every normal autofarm assumes:
 The place itself reinforces this: the entire workspace contains **one** `RemoteEvent`
 (`__THINGS.__REMOTES.__INTRO`). There is no cooking remote to fire even if firing worked.
 
-So every job must reach its goal through one of three doors:
+So every job must reach its goal through one of four doors:
 
 1. **walk there and press the prompt's own key** (`ProximityPrompt`)
 2. **walk there and click the part** (`ClickDetector`)
 3. **equip a hotbar tool and press its number** (only if the tool is already in the hotbar)
+4. **click the button the player would click** (`PlayerGui`, via `AbsolutePosition`)
 
 Anything that cannot be expressed as one of those is not automatable in this build, and the
 modules below say so out loud instead of failing silently.
@@ -46,6 +47,7 @@ Build order matters — `build.ps1` concatenates these in filename order into on
 |---|---|---|
 | `00_boot` | namespace, logging, config, utilities | nothing throws at the top level; config persists across runs |
 | `10_caps` | capability probe | every later module reads facts, not assumptions |
+| `12_keymap` | `Enum.KeyCode` → VK translation | a prompt's key is pressed on the key the engine meant, not the ASCII value |
 | `15_input` | keyboard/mouse injection | no input leaves the process unless Roblox is foreground |
 | `20_move` | locomotion | reaches a target with writes *or* walking, and says which |
 | `25_world` | world snapshot | the place never freezes, even at 64k instances |
@@ -109,6 +111,33 @@ A prompt attached to a customer moves. A cached `Position` from scan time would 
 to where that customer was thirty seconds ago. `livePrompts()` re-reads the anchor position
 per call; with 20 prompts that is free.
 
+### Why there is a key-code table (`12_keymap`)
+
+`Enum.KeyCode` is not a virtual-key code. It reuses ASCII, so `Enum.KeyCode.E.Value` is
+`101`, and `keypress(101)` presses numpad-5 — the prompt never opens and nothing in the log
+says why. `12_keymap` maps Roblox codes onto VK codes and prefers `.Name` over `.Value`
+because the name is authoritative. The same table feeds movement keys, so `15_input` and
+`30_act` cannot drift apart.
+
+### Why activation is observed, not assumed (`Act.watch`)
+
+Roblox shows at most one prompt per key (`OnePerButton`) or one in total
+(`OneGlobally`), and decides by camera direction. A press aimed at the wrong prompt is
+swallowed without an error. `ProximityPromptService.PromptShown` / `PromptHidden` /
+`PromptTriggered` turn that into events: when the service is exposed, "is mine active"
+and "did the press land" stop being heuristics. When it is not, `Act.competitors` answers
+the same question from camera geometry, and `strict` mode refuses to press at all rather
+than trigger a neighbour.
+
+### Why GUI buttons are a first-class surface (`World.guiButtons`, `Act.clickGui`)
+
+`PlayerGui` is where the game keeps everything with no part and no prompt: shops, cooking
+menus, upgrades. `GuiObject.AbsolutePosition` and `AbsoluteSize` are already in screen
+pixels, which is the same space `mousemoveabs` uses, so a button can be clicked at
+`centre = AbsolutePosition + AbsoluteSize/2`. Visibility is checked up the whole ancestor
+chain (`Util.guiShown`), because a button's own `Visible` stays `true` inside a hidden
+frame or a disabled `ScreenGui`. This is the only path that reaches GUI-driven systems.
+
 ### Why the scheduler separates weight from cooldown (`35_jobs`)
 
 Weight is "how much does this matter right now", cooldown is "how often may it run". A job
@@ -125,13 +154,20 @@ named NPCs, the shops, the one RemoteEvent.
 
 **Proven by the docs:** the API surface in `MATCHA-API.md`.
 
-**Proven by execution:** only the syntax and the static checks in `check.ps1` / `tools/lint.js`.
-Nothing here has been run inside Roblox yet. That is why `10_caps` exists — first run tells
-us which assumptions held.
+**Proven by execution:** `src/` is parsed as Lua 5.1 by `check.ps1` (13 files), linted by
+`tools/lint.js` (forbidden APIs, silent globals, chunk-local budget), and the seven
+client-independent modules are executed in a real Luau VM by `run-tests.ps1` — 44
+assertions covering key mapping, projection, prompt flags, exclusivity, GUI geometry and
+click routing. A green run means the logic is correct, not just parseable.
+
+**Not yet proven:** none of it has run inside Roblox. `10_caps` exists to convert the
+remaining assumptions into facts on the first launch.
 
 **Not known:** how cooking, serving, seating and cleaning are actually triggered. See
-`GAME-MODEL.md`. Until `diagnostics/recon.txt` exists, any "restaurant job" would be
-fiction, so there isn't one.
+`GAME-MODEL.md`. `tools/DumpScripts.lua` is the intended answer — `getscripts()` +
+`decompile()` returns the client's own interaction code, which is where the prompt
+handlers and GUI wiring live. Until that or `diagnostics/recon.txt` exists, any
+"restaurant job" would be fiction, so there isn't one.
 
 ---
 
@@ -179,7 +215,9 @@ either the station prompts spawn with a tool equipped, or cooking happens throug
 backpack tool, or through GUI buttons.
 
 Needed from recon: the tool list, the PlayerGui text while standing at a stove, and any
-prompt that appears mid-order.
+prompt that appears mid-order. `tools/DumpScripts.lua` answers all three faster than
+behavioural capture, because the client's own prompt handlers and GUI wiring are in the
+source.
 
 ### 5.2 Identity: which restaurant is mine
 
@@ -204,8 +242,10 @@ prompt jobs in `50_jobs_world.lua` already cover these, because the names are co
 ### 5.5 Economy systems — *blocked on recon*
 
 `Shop`, `StationsMerchant`, `BaitMerchant`, `PetMerchant`, `BlackMarket`, `GlobalMarket`,
-`LimitedItemStands`, `FireworkNodes`. None of these expose prompts in the dump, so purchase
-interaction is unknown: likely ClickDetector on a stand, or a GUI.
+`LimitedItemStands`, `FireworkNodes`. None of these expose prompts in the dump. Either
+case is now covered: `Act.clickDetector` for a stand, `World.findGui` +
+`Act.clickGuiNamed` for a menu. The remaining unknown is *when* a menu is open, which is
+what `Caps.probe`'s GUI section reports (screen names and button labels) on first run.
 
 ### 5.6 Fishing — *partially unblocked*
 
@@ -227,13 +267,40 @@ character has not moved for 60 s with jobs enabled.
 
 ## 6. Known weak points
 
-1. `Move.lookAt` assumes right-mouse drag rotates the camera the default way. Places that
-   force first-person or lock the camera will defeat it; the probe should be extended to
-   detect that.
-2. `Act.prompt` presses the key without confirming focus. If the prompt is not selected, the
-   key press goes to the game world instead (often harmless, sometimes a tool swing).
-3. The scheduler runs one job per 60 ms slice; a job that blocks for 10 s starves the rest.
+1. `Move.lookAt` assumes right-mouse drag rotates the camera the default way. `CameraType`
+   is reported by the probe now, but a place that locks first-person still defeats manual
+   steering; walk mode then fails instead of looping forever.
+2. A prompt press is only meaningful when the target owns the input slot. `strict` mode and
+   `Act.watch` cover that, but without `ProximityPromptService` the geometry fallback can be
+   wrong when two prompts project to nearly the same pixel.
+3. GUI clicks do not model occlusion. If a modal covers the button, the click lands on the
+   modal; `verify` is the only defence.
+4. The scheduler runs one job per 60 ms slice; a job that blocks for 10 s starves the rest.
    That is acceptable now, not forever.
-4. `World.maxItems = 90000` is above the current 64k, so a bigger place would truncate
+5. `World.maxItems = 90000` is above the current 64k, so a bigger place would truncate
    silently. It logs the queue size at scan start, which is the tell.
-5. Config values are flat strings; there is no schema or migration.
+6. Config values are flat strings; there is no schema or migration.
+7. `PlayerGui` is re-read on demand rather than cached, because client scripts rebuild menus
+   constantly. That is correct, but it means `World.findGui` is O(descendants) and must not
+   be called in a tight loop.
+
+---
+
+## 7. Verification pipeline
+
+```powershell
+.\build.ps1        # src/*.lua -> dist/RunRestaurant.lua, one module per file, in order
+.\check.ps1        # luaparse 5.1 syntax gate on every src file, dist and tools
+node tools\lint.js # forbidden APIs, undeclared globals, chunk-local budget
+.\run-tests.ps1    # executes src in Luau 0.744 against tests/spec.luau
+```
+
+`run-tests.ps1` concatenates `tests/stub.luau` (a minimal fake Roblox: clock, Vector2/3,
+CFrame, Drawing, services, a PlayerGui with one visible and one hidden button), the seven
+client-independent modules, and `tests/spec.luau`. The stub shadows `_G` with a plain
+table because the Luau CLI freezes the real one; every module resolves `_G` to that table
+exactly as Matcha's loader would.
+
+A module belongs in the suite only if it loads without a live client. `35_jobs`, `40_ui`,
+`50_jobs_world` and `60_main` need services the stub does not pretend to provide, so they
+are covered by `check.ps1` and `lint.js` only.

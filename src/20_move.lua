@@ -40,12 +40,7 @@ local function camera()
 end
 
 local function viewport()
-  local cam = camera()
-  if not cam then return Vector2.new(1280, 720) end
-  local vp = nil
-  pcall(function() vp = cam.ViewportSize end)
-  if vp then return vp end
-  return Vector2.new(1280, 720)
+  return RR.Util.viewport()
 end
 
 local function project(pos)
@@ -113,7 +108,29 @@ end
 -- ---------------------------------------------------------------------
 -- camera steering + walking
 -- ---------------------------------------------------------------------
-function Move.lookAt(target, tolPx, maxMs)
+-- Right-mouse drag is the only documented way to rotate the camera, and
+-- it is a *held* gesture: pressing and releasing it every frame makes
+-- the view jitter and wastes input. These two track the state so a walk
+-- can hold the drag for its whole duration.
+Move.aimHeld = false
+
+function Move.aimBegin()
+  if Move.aimHeld then return true end
+  local ok = pcall(function() mouse2press() end)
+  Move.aimHeld = ok and true or false
+  return Move.aimHeld
+end
+
+function Move.aimEnd()
+  if not Move.aimHeld then return false end
+  pcall(function() mouse2release() end)
+  Move.aimHeld = false
+  return true
+end
+
+-- keepHeld: leave the right button down so the caller can steer again
+-- without a press/release cycle around every correction.
+function Move.lookAt(target, tolPx, maxMs, keepHeld)
   tolPx = tolPx or 45
   maxMs = maxMs or 900
   if not RR.Input.focused() then return false, "not focused" end
@@ -122,7 +139,7 @@ function Move.lookAt(target, tolPx, maxMs)
   local cx = vp.X / 2
   local cy = vp.Y / 2
 
-  local held = false
+  local held = Move.aimBegin()
   local deadline = tick() + (maxMs / 1000)
   local converged = false
   local searched = 0
@@ -137,20 +154,12 @@ function Move.lookAt(target, tolPx, maxMs)
         converged = true
         break
       end
-      if not held then
-        pcall(function() mouse2press() end)
-        held = true
-      end
       -- cap the step so one frame cannot spin past the target
       local stepX = RR.Util.clamp(dx * 0.42, -140, 140)
       local stepY = RR.Util.clamp(dy * 0.42, -110, 110)
       RR.Input.moveRel(stepX, stepY)
     else
       -- behind us: drag sideways in fixed steps until it is on screen
-      if not held then
-        pcall(function() mouse2press() end)
-        held = true
-      end
       RR.Input.moveRel(150, 0)
       searched = searched + 1
       if searched > 24 then break end
@@ -158,10 +167,10 @@ function Move.lookAt(target, tolPx, maxMs)
     wait(0.03)
   end
 
-  if held then
-    pcall(function() mouse2release() end)
+  if not keepHeld then
+    Move.aimEnd()
   end
-  return converged
+  return converged, held and nil or "right-mouse drag unavailable"
 end
 
 function Move.unstick()
@@ -189,22 +198,34 @@ function Move.walkTo(target, tol, maxMs)
   local lastPos = RR.Util.charPos()
   local lastProgress = tick()
 
+  -- single exit so W is always released, even on the error paths
+  local function finish(ok, why)
+    RR.Input.keyUp(VK.W)
+    Move.aimEnd()
+    if ok then
+      Move.Stats.arrived = Move.Stats.arrived + 1
+    else
+      Move.Stats.failed = Move.Stats.failed + 1
+      Move.Stats.lastErr = why or "walk failed"
+    end
+    return ok, why
+  end
+
   RR.Input.keyDown(VK.W)
 
   while tick() < deadline do
     if not RR.Util.alive() then
-      RR.Input.keyUp(VK.W)
-      return false, "died"
+      return finish(false, "died")
     end
 
     local pos = RR.Util.charPos()
     if pos and (pos - target).Magnitude <= tol then
-      RR.Input.keyUp(VK.W)
-      Move.Stats.arrived = Move.Stats.arrived + 1
-      return true
+      return finish(true, "walk")
     end
 
-    Move.lookAt(target, 60, 260)
+    -- keep the right button held across corrections; releasing it every
+    -- loop made the camera stutter and the walk slower
+    Move.lookAt(target, 60, 260, true)
 
     if pos and lastPos then
       if (pos - lastPos).Magnitude < 0.35 then
@@ -221,14 +242,12 @@ function Move.walkTo(target, tol, maxMs)
     wait(0.04)
   end
 
-  RR.Input.keyUp(VK.W)
-  Move.Stats.failed = Move.Stats.failed + 1
-  Move.Stats.lastErr = "walk timeout"
-  return false, "timeout"
+  return finish(false, "timeout")
 end
 
 function Move.stop()
   pcall(function() RR.Input.keyUp(VK.W) end)
+  pcall(function() Move.aimEnd() end)
   local hrp = RR.Util.hrp()
   if hrp then
     pcall(function() hrp.AssemblyLinearVelocity = Vector3.new(0, 0, 0) end)

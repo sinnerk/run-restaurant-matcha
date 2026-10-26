@@ -106,10 +106,19 @@ __THINGS.Restaurants.Restaurant_69.Entities.Trading Booth.Interact.ProximityProm
 ### Everything else
 
 - `RemoteEvent`: **1** (`__THINGS.__REMOTES.__INTRO`)
-- `Tool` in workspace: **0** — but the scan never touched `Backpack`, so equipped/held tools
-  were invisible
+- `Tool` in workspace: **0** — because tools live in `Player.Backpack` until equipped, and the
+  scan never touched `Backpack`. `Caps.probe` now reads `Backpack` and the character and
+  records the tool names; any tool in there is an interaction the dump could not see.
 - `LocalScript`: 4 · `BindableFunction`: 4 · `ImageButton`: 8 · `SurfaceGui`: 29
 - `TextLabel`: 240 · `Frame`: 5,055 · `BillboardGui`: 64
+
+Those 8 `ImageButton`s are inside `SurfaceGui`s **in the workspace**, not in `PlayerGui`:
+they are drawn on the surface of a part, so they are clicked through the part, not through
+`AbsolutePosition`. `Act.clickPart` hits the part's centre, which is not necessarily where
+the button is on its face — a targeted offset is needed once the surface is identified.
+
+The 5,055 `Frame`s and 240 `TextLabel`s are also workspace UI (billboards and surfaces).
+`PlayerGui` is a separate tree that the dump never saw; `Caps.probe` reports it now.
 
 ---
 
@@ -126,11 +135,18 @@ Three explanations, all testable:
 3. **Proximity to NPC.** Prompts appear when a customer is seated nearby, and the scan caught
    the server between waves.
 
-Distinguishing these needs one thing: `diagnostics/recon.txt` from `tools/Recon.lua`, which
-scans `Backpack`, `PlayerGui`, and watches for 90 seconds while you actually play a round.
+Distinguishing these needs one of two captures:
 
-Until then, a "cook" job would be written against names nobody has seen, which is exactly
-how v1–v3 failed.
+1. **`tools/DumpScripts.lua`** (preferred) — `getscripts()` + `decompile()` returns the
+   client's own LocalScripts and ModuleScripts. Whatever handles a stove is in there, along
+   with the GUI wiring and the remote names. `scripts/findings.txt` is the derived summary
+   (names, key codes, classes, quoted labels) and is safe to commit; the decompiled `.lua`
+   files are not.
+2. **`tools/Recon.lua`** — behavioural fallback. Watches `Backpack`, `PlayerGui` and the
+   prompt set for 90 seconds while you play a round, and writes `diagnostics/recon.txt`.
+
+Until one of them exists, a "cook" job would be written against names nobody has seen, which
+is exactly how v1–v3 failed.
 
 ---
 

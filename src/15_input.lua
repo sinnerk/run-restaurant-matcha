@@ -17,16 +17,9 @@ Input.Stats = Input.Stats or {
   lastAt  = 0,
 }
 
-Input.VK = {
-  A = 0x41, B = 0x42, C = 0x43, D = 0x44, E = 0x45, F = 0x46, G = 0x47,
-  H = 0x48, I = 0x49, J = 0x4A, K = 0x4B, L = 0x4C, M = 0x4D, N = 0x4E,
-  O = 0x4F, P = 0x50, Q = 0x51, R = 0x52, S = 0x53, T = 0x54, U = 0x55,
-  V = 0x56, W = 0x57, X = 0x58, Y = 0x59, Z = 0x5A,
-  SPACE = 0x20, ENTER = 0x0D, ESC = 0x1B, TAB = 0x09, SHIFT = 0x10,
-  CTRL = 0x11, ALT = 0x12, LEFT = 0x25, UP = 0x26, RIGHT = 0x27, DOWN = 0x28,
-  DIGIT1 = 0x31, DIGIT2 = 0x32, DIGIT3 = 0x33, DIGIT4 = 0x34, DIGIT5 = 0x35,
-  DIGIT6 = 0x36, DIGIT7 = 0x37, DIGIT8 = 0x38, DIGIT9 = 0x39, DIGIT0 = 0x30,
-}
+-- The canonical table lives in 12_keymap so prompt keys and movement keys
+-- cannot drift apart. Roblox KeyCode values are NOT VK codes; see that file.
+Input.VK = RR.KeyMap.VK
 
 local lastBlockLog = 0
 
@@ -128,6 +121,22 @@ function Input.clickAt(worldPos, offsetX, offsetY)
     return false
   end
   wait(0.04)
+  return Input.click()
+end
+
+-- Click a point that is already in viewport pixels, as returned by
+-- GuiObject.AbsolutePosition/AbsoluteSize. Matcha documents mousemoveabs
+-- as using the same pixel space as WorldToScreen and Camera.ViewportSize,
+-- which is exactly the space AbsolutePosition resolves to, so no window
+-- origin maths is needed.
+function Input.clickScreen(x, y)
+  if type(x) ~= "number" or type(y) ~= "number" then return false end
+  if x ~= x or y ~= y then return false end -- NaN guard
+
+  local vp = RR.Util.viewport()
+  if x < 2 or y < 2 or x > vp.X - 2 or y > vp.Y - 2 then return false end
+  if not Input.moveAbs(x, y) then return false end
+  wait(0.05)
   return Input.click()
 end
 

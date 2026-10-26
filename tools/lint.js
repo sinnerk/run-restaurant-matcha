@@ -115,6 +115,33 @@ for (const file of files) {
   }
 }
 
+// ---------------------------------------------------------------------
+// 4. the concatenated build is ONE chunk, so its top-level locals all
+//    share the 200-register limit. Eleven modules each opening with
+//    `local RR = _G.RR` is fine today, but this is the failure that
+//    arrives suddenly and reports a confusing syntax error.
+// ---------------------------------------------------------------------
+const dist = path.join(root, 'dist', 'RunRestaurant.lua');
+if (fs.existsSync(dist)) {
+  const src = fs.readFileSync(dist, 'utf8');
+  try {
+    const ast = lp.parse(src, { luaVersion: '5.1', locations: true });
+    let topLocals = 0;
+    for (const node of ast.body) {
+      if (node.type === 'LocalStatement') topLocals += node.variables.length;
+    }
+    if (topLocals > 190) {
+      report(dist, 1, `${topLocals} top-level locals in one chunk (limit is 200)`);
+    } else if (topLocals > 160) {
+      console.log(`  note: ${topLocals} top-level locals in the combined chunk, close to the 200 limit`);
+    } else {
+      console.log(`  chunk locals: ${topLocals}/200`);
+    }
+  } catch (e) {
+    report(dist, 0, 'parse error: ' + e.message);
+  }
+}
+
 if (problems === 0) {
   console.log(`clean: ${files.length} modules, 0 problems`);
 } else {

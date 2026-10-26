@@ -1,5 +1,5 @@
 -- Run a Restaurant! - Matcha toolkit
--- built 2026-10-25 13:30
+-- built 2026-10-26 03:13
 -- paste this whole file into Matcha and execute
 
 
@@ -21,7 +21,7 @@ if type(RR) ~= "table" then
   _G.RR = RR
 end
 
-RR.VERSION  = "5.0.0"
+RR.VERSION  = "5.1.0"
 RR.NAME     = "Run a Restaurant! toolkit"
 RR.STARTED  = tick()
 RR.FEATURES = RR.FEATURES or {}
@@ -309,6 +309,82 @@ function Util.contains(haystack, needle)
   return string.find(string.lower(haystack), string.lower(needle), 1, true) ~= nil
 end
 
+-- camera viewport, with a sane fallback so callers never nil-index
+function Util.viewport()
+  local ws = svc("Workspace")
+  if not ws then return Vector2.new(1280, 720) end
+  local cam = nil
+  pcall(function() cam = ws.CurrentCamera end)
+  if not cam then return Vector2.new(1280, 720) end
+  local vp = nil
+  pcall(function() vp = cam.ViewportSize end)
+  if vp then return vp end
+  return Vector2.new(1280, 720)
+end
+
+-- world -> screen, nil when behind the camera or the projection failed.
+-- WorldToScreen returns (Vector2, bool) so both results matter.
+function Util.project(pos)
+  if not pos then return nil end
+  local sp, onScreen = nil, false
+  local ok = pcall(function() sp, onScreen = WorldToScreen(pos) end)
+  if not ok or onScreen ~= true or not sp then return nil end
+  return sp
+end
+
+-- pixel distance from the centre of the screen; math.huge when off-screen.
+-- lower means "closer to where the camera is looking", which is how
+-- Roblox picks which of several in-range prompts is the visible one.
+function Util.focusScore(pos)
+  local sp = Util.project(pos)
+  if not sp then return math.huge end
+  local vp = Util.viewport()
+  local dx = sp.X - (vp.X / 2)
+  local dy = sp.Y - (vp.Y / 2)
+  return math.sqrt(dx * dx + dy * dy)
+end
+
+-- ---------------------------------------------------------------------
+-- GUI geometry
+-- ---------------------------------------------------------------------
+-- A button is only really clickable when every ancestor is visible and
+-- its ScreenGui is enabled. Reading .Visible on the button alone reports
+-- every hidden menu in PlayerGui as clickable, and then the click lands
+-- on whatever is behind it.
+function Util.guiShown(obj)
+  if not obj then return false end
+  local cur = obj
+  for _ = 1, 32 do
+    local vis, en, cls, parent = nil, nil, nil, nil
+    pcall(function()
+      vis = cur.Visible
+      en = cur.Enabled
+      cls = cur.ClassName
+      parent = cur.Parent
+    end)
+
+    if vis == false then return false end
+    if en == false then return false end
+    if cls == "PlayerGui" or parent == nil then return true end
+    cur = parent
+  end
+  return false
+end
+
+-- centre of a GuiObject, in the same pixel space as mousemoveabs and
+-- Camera.ViewportSize. AbsolutePosition/AbsoluteSize are already
+-- resolved to pixels by the engine, so no UDim2 arithmetic is needed.
+function Util.guiCenter(obj)
+  local ap, as = nil, nil
+  pcall(function()
+    ap = obj.AbsolutePosition
+    as = obj.AbsoluteSize
+  end)
+  if not ap or not as then return nil end
+  if as.X <= 1 or as.Y <= 1 then return nil end
+  return Vector2.new(ap.X + (as.X / 2), ap.Y + (as.Y / 2))
+end
+
 RR.log("boot ok - " .. RR.VERSION)
 
 -- ======================================================================
@@ -449,6 +525,14 @@ local function probeCamera()
   out.position = tryRead(cam, "Position")
   out.fieldOfView = tryRead(cam, "FieldOfView")
   out.cframe = tryRead(cam, "CFrame")
+  -- If this is Scriptable, mouse-drag steering does nothing and walk mode
+  -- has to give up instead of spinning in place.
+  local ctype = tryRead(cam, "CameraType")
+  if ctype ~= nil then
+    local n = nil
+    pcall(function() n = ctype.Name end)
+    out.cameraType = n or string.match(tostring(ctype), "([%w_]+)$")
+  end
   out.worldToViewport = false
   local ok = pcall(function() cam:WorldToViewportPoint(Vector3.new(0, 0, 0)) end)
   out.worldToViewport = ok
@@ -477,8 +561,29 @@ local function probePrompt()
   out.hold     = tryRead(prompt, "HoldDuration")
   out.maxDist  = tryRead(prompt, "MaxActivationDistance")
   out.requiresLineOfSight = tryRead(prompt, "RequiresLineOfSight")
+  out.clickable = tryRead(prompt, "ClickablePrompt")
   out.objectText = tryRead(prompt, "ObjectText")
   out.actionText = tryRead(prompt, "ActionText")
+
+  -- The exact value the bridge hands back matters: an Enum.KeyCode's
+  -- .Value is ASCII (E = 101), a VK is 69, and pressing the wrong one
+  -- silently does nothing.
+  out.keyRaw  = tostring(out.keyCode)
+  out.keyVK   = RR.KeyMap.resolve(out.keyCode, nil)
+  out.keyDesc = RR.KeyMap.describe(out.keyCode)
+
+  local excl = tryRead(prompt, "Exclusivity")
+  if excl ~= nil then
+    local n = nil
+    pcall(function() n = excl.Name end)
+    out.exclusivity = n or string.match(tostring(excl), "([%w_]+)$")
+  end
+
+  -- Does the class method exist? Only checked, never called: calling it
+  -- on a live prompt could trigger it.
+  out.inputHold = false
+  pcall(function() out.inputHold = type(prompt.InputHoldBegin) == "function" end)
+
   return out
 end
 
@@ -513,6 +618,94 @@ local function probeStorage()
   return out
 end
 
+-- Tools are the interaction surface the original scan could not see:
+-- the workspace had zero Tool instances because everything sits in the
+-- Backpack or the character's hand. Names here drive the hotbar jobs.
+local function probeTools()
+  local out = { backpack = 0, equipped = 0, names = {} }
+
+  local lp = RR.Util.localPlayer()
+  if not lp then return out end
+
+  local function scan(container, key)
+    if not container then return end
+    local kids = nil
+    local ok = pcall(function() kids = container:GetChildren() end)
+    if not ok or type(kids) ~= "table" then return end
+    for i = 1, #kids do
+      local child = kids[i]
+      if tryRead(child, "ClassName") == "Tool" then
+        out[key] = out[key] + 1
+        if #out.names < 24 then
+          out.names[#out.names + 1] = tostring(tryRead(child, "Name"))
+        end
+      end
+    end
+  end
+
+  local bp = nil
+  pcall(function() bp = lp:FindFirstChildOfClass("Backpack") end)
+  scan(bp, "backpack")
+
+  local ch = nil
+  pcall(function() ch = lp.Character end)
+  scan(ch, "equipped")
+
+  out.canActivate = false
+  if bp then
+    local kids = nil
+    pcall(function() kids = bp:GetChildren() end)
+    for i = 1, #(kids or {}) do
+      if tryRead(kids[i], "ClassName") == "Tool" then
+        pcall(function() out.canActivate = type(kids[i].Activate) == "function" end)
+        break
+      end
+    end
+  end
+
+  return out
+end
+
+-- GUI recon: the menus are the part of the game no workspace scan can
+-- see, and their labels are the game's own vocabulary for every action
+-- it offers. This is usually the most useful section of the report.
+local function probeGui()
+  local out = { count = 0, screens = {}, labels = {}, readable = false }
+
+  local lp = RR.Util.localPlayer()
+  if not lp then return out end
+
+  local pg = nil
+  pcall(function() pg = lp:FindFirstChildOfClass("PlayerGui") end)
+  if not pg then return out end
+
+  local list = nil
+  local ok = pcall(function() list = pg:GetDescendants() end)
+  if not ok or type(list) ~= "table" then return out end
+  out.readable = true
+
+  for i = 1, #list do
+    local o = list[i]
+    local cls = tryRead(o, "ClassName")
+
+    if cls == "ScreenGui" then
+      if #out.screens < 14 then
+        out.screens[#out.screens + 1] = tostring(tryRead(o, "Name"))
+      end
+    elseif cls == "TextButton" or cls == "ImageButton" then
+      if RR.Util.guiShown(o) then
+        out.count = out.count + 1
+        local label = tryRead(o, "Text")
+        if type(label) == "string" and label ~= "" and #out.labels < 20 then
+          out.labels[#out.labels + 1] = label
+        end
+      end
+    end
+  end
+
+  return out
+end
+
 function Caps.probe()
   Caps.data = {}
   local d = Caps.data
@@ -538,6 +731,8 @@ function Caps.probe()
   d.camera = probeCamera()
   d.prompt = probePrompt()
   d.storage = probeStorage()
+  d.tools = probeTools()
+  d.gui = probeGui()
 
   local doMove = RR.Cfg.get("capsMoveTest", true)
   if doMove then
@@ -576,11 +771,29 @@ function Caps.format()
   out[#out + 1] = "missing       : " .. (#d.missing == 0 and "none" or table.concat(d.missing, ", "))
   out[#out + 1] = "humanoid      : health=" .. yn(d.humanoid.health) .. " walk=" .. yn(d.humanoid.walkSpeed) .. " moveTo=" .. yn(d.humanoid.moveTo)
   out[#out + 1] = "camera        : cframe=" .. yn(d.camera.cframe ~= nil) .. " w2v=" .. yn(d.camera.worldToViewport)
-  out[#out + 1] = "prompt        : " .. (d.prompt.found and ("key=" .. yn(d.prompt.keyCode) .. " hold=" .. yn(d.prompt.hold) .. " range=" .. yn(d.prompt.maxDist)) or "none in workspace")
+  out[#out + 1] = "prompt        : " .. (d.prompt.found and ("key=" .. yn(d.prompt.keyDesc) .. " hold=" .. yn(d.prompt.hold) .. " range=" .. yn(d.prompt.maxDist) .. " los=" .. yn(d.prompt.requiresLineOfSight) .. " click=" .. yn(d.prompt.clickable) .. " inputHold=" .. yn(d.prompt.inputHold)) or "none in workspace")
+  out[#out + 1] = "prompt excl   : " .. yn(d.prompt.exclusivity)
   out[#out + 1] = "movement      : mode=" .. tostring(d.move.mode) .. " pos=" .. yn(d.move.positionStuck) .. " vel=" .. yn(d.move.velocityMoved)
+  out[#out + 1] = "camera type   : " .. yn(d.camera.cameraType)
   out[#out + 1] = "replicatedstg : " .. yn(d.storage.replicatedStorage) .. " children=" .. yn(d.storage.replicatedStorageChildren)
   out[#out + 1] = "backpack      : " .. yn(d.storage.backpack) .. " items=" .. yn(d.storage.backpackItems)
   out[#out + 1] = "playergui     : " .. yn(d.storage.playerGui) .. " nodes=" .. yn(d.storage.playerGuiDescendants)
+  local tools = d.tools or {}
+  local tnames = tools.names or {}
+  out[#out + 1] = "tools         : bag=" .. yn(tools.backpack) .. " held=" .. yn(tools.equipped) .. " activate=" .. yn(tools.canActivate)
+  if #tnames > 0 then
+    out[#out + 1] = "tool names    : " .. table.concat(tnames, ", ")
+  end
+  local gui = d.gui or {}
+  out[#out + 1] = "gui           : readable=" .. yn(gui.readable) .. " buttons=" .. yn(gui.count)
+  local screens = gui.screens or {}
+  if #screens > 0 then
+    out[#out + 1] = "gui screens   : " .. table.concat(screens, ", ")
+  end
+  local labels = gui.labels or {}
+  if #labels > 0 then
+    out[#out + 1] = "gui buttons   : " .. table.concat(labels, " | ")
+  end
   return table.concat(out, "\n")
 end
 
@@ -592,6 +805,261 @@ end
 
 function Caps.hasGlobal(name)
   return rawget(_G, name) ~= nil
+end
+
+-- ======================================================================
+-- 12_keymap.lua
+-- ======================================================================
+--[[ ==================================================================
+     12_keymap : Roblox KeyCode  ->  Windows virtual-key
+
+     This module exists because of a bug that would have made every
+     prompt press land on the wrong key.
+
+     Roblox's KeyCode enum is not a Windows VK code. It reuses ASCII:
+
+         Enum.KeyCode.A   = 97    ('a')      Windows VK_A  = 65
+         Enum.KeyCode.E   = 101   ('e')      Windows VK_E  = 69
+         Enum.KeyCode.Z   = 122   ('z')      Windows VK_Z  = 90
+
+     So reading `.Value` and handing it to keypress() presses numpad
+     keys: 101 is VK_NUMPAD5, not E. The cheat never fires, the prompt
+     never opens, and nothing in the log says why.
+
+     Everything here is pure: no services, no globals, no side effects,
+     so tests/ can execute it under a real Luau VM.
+
+     Reference: https://create.roblox.com/docs/reference/engine/enums/KeyCode
+     ================================================================== ]]
+
+local RR = rawget(_G, "RR")
+if type(RR) ~= "table" then
+  RR = {}
+  _G.RR = RR
+end
+
+local KeyMap = RR.KeyMap or {}
+RR.KeyMap = KeyMap
+
+-- ---------------------------------------------------------------------
+-- named constants (VK)
+-- ---------------------------------------------------------------------
+KeyMap.VK = {
+  A = 0x41, B = 0x42, C = 0x43, D = 0x44, E = 0x45, F = 0x46, G = 0x47,
+  H = 0x48, I = 0x49, J = 0x4A, K = 0x4B, L = 0x4C, M = 0x4D, N = 0x4E,
+  O = 0x4F, P = 0x50, Q = 0x51, R = 0x52, S = 0x53, T = 0x54, U = 0x55,
+  V = 0x56, W = 0x57, X = 0x58, Y = 0x59, Z = 0x5A,
+
+  DIGIT0 = 0x30, DIGIT1 = 0x31, DIGIT2 = 0x32, DIGIT3 = 0x33, DIGIT4 = 0x34,
+  DIGIT5 = 0x35, DIGIT6 = 0x36, DIGIT7 = 0x37, DIGIT8 = 0x38, DIGIT9 = 0x39,
+
+  SPACE = 0x20, ENTER = 0x0D, ESC = 0x1B, TAB = 0x09, BACKSPACE = 0x08,
+  SHIFT = 0x10, CTRL = 0x11, ALT = 0x12, CAPSLOCK = 0x14,
+  LSHIFT = 0xA0, RSHIFT = 0xA1, LCTRL = 0xA2, RCTRL = 0xA3,
+  LALT = 0xA4, RALT = 0xA5,
+
+  LEFT = 0x25, UP = 0x26, RIGHT = 0x27, DOWN = 0x28,
+  INSERT = 0x2D, DELETE = 0x2E, HOME = 0x24, END = 0x23,
+  PAGEUP = 0x21, PAGEDOWN = 0x22,
+
+  F1 = 0x70, F2 = 0x71, F3 = 0x72, F4 = 0x73, F5 = 0x74, F6 = 0x75,
+  F7 = 0x76, F8 = 0x77, F9 = 0x78, F10 = 0x79, F11 = 0x7A, F12 = 0x7B,
+}
+
+local VK = KeyMap.VK
+
+-- ---------------------------------------------------------------------
+-- Roblox KeyCode -> VK
+-- ---------------------------------------------------------------------
+-- Only codes that are unambiguously Roblox KeyCodes go in this table.
+-- Anything not listed returns nil and the caller decides the fallback;
+-- guessing here means pressing a key nobody asked for.
+local CODE_TO_VK = {
+  [8]   = VK.BACKSPACE,
+  [9]   = VK.TAB,
+  [13]  = VK.ENTER,
+  [27]  = VK.ESC,
+  [32]  = VK.SPACE,
+  [44]  = 0xBC,          -- Comma
+  [45]  = 0xBD,          -- Minus
+  [46]  = 0xBE,          -- Period
+  [47]  = 0xBF,          -- Slash
+  [59]  = 0xBA,          -- Semicolon
+  [61]  = 0xBB,          -- Equals
+  [91]  = 0xDB,          -- LeftBracket
+  [92]  = 0xDC,          -- BackSlash
+  [93]  = 0xDD,          -- RightBracket
+  [96]  = 0xC0,          -- Backquote
+  [127] = VK.DELETE,
+  [273] = VK.UP,
+  [274] = VK.DOWN,
+  [275] = VK.RIGHT,
+  [276] = VK.LEFT,
+  [277] = VK.INSERT,
+  [278] = VK.HOME,
+  [279] = VK.END,
+  [280] = VK.PAGEUP,
+  [281] = VK.PAGEDOWN,
+  [300] = 0x90,          -- NumLock
+  [301] = VK.CAPSLOCK,
+  [302] = 0x91,          -- ScrollLock
+  [303] = VK.RSHIFT,
+  [304] = VK.LSHIFT,
+  [305] = VK.RCTRL,
+  [306] = VK.LCTRL,
+  [307] = VK.RALT,
+  [308] = VK.LALT,
+}
+
+-- digits 48..57 are already VK 0x30..0x39
+for i = 0, 9 do
+  CODE_TO_VK[48 + i] = 0x30 + i
+end
+
+-- keypad 256..265 -> VK 0x60..0x69, then the operators
+for i = 0, 9 do
+  CODE_TO_VK[256 + i] = 0x60 + i
+end
+CODE_TO_VK[266] = 0x6E   -- KeypadPeriod
+CODE_TO_VK[267] = 0x6F   -- KeypadDivide
+CODE_TO_VK[268] = 0x6A   -- KeypadMultiply
+CODE_TO_VK[269] = 0x6D   -- KeypadMinus
+CODE_TO_VK[270] = 0x6B   -- KeypadPlus
+CODE_TO_VK[271] = VK.ENTER
+CODE_TO_VK[272] = 0xBB   -- KeypadEquals
+
+-- F1..F12 are 282..293, which is VK 0x70..0x7B exactly
+for i = 0, 11 do
+  CODE_TO_VK[282 + i] = 0x70 + i
+end
+
+-- letters are 97..122 ('a'..'z'), which is VK 0x41..0x5A
+for i = 0, 25 do
+  CODE_TO_VK[97 + i] = 0x41 + i
+end
+
+function KeyMap.codeToVK(code)
+  if type(code) ~= "number" then return nil end
+  if code <= 0 then return nil end
+
+  local vk = CODE_TO_VK[code]
+  if vk then return vk end
+
+  -- 65..90 is not a valid Roblox KeyCode at all, so a value in that
+  -- range is already a virtual-key code for a letter. Pass it through.
+  if code >= 65 and code <= 90 then return code end
+
+  return nil
+end
+
+-- ---------------------------------------------------------------------
+-- name -> VK
+-- ---------------------------------------------------------------------
+local NAME_TO_VK = {
+  space = VK.SPACE, spacebar = VK.SPACE,
+  ["return"] = VK.ENTER, enter = VK.ENTER,
+  escape = VK.ESC, esc = VK.ESC,
+  tab = VK.TAB, backspace = VK.BACKSPACE, delete = VK.DELETE,
+  insert = VK.INSERT, home = VK.HOME, ["end"] = VK.END,
+  pageup = VK.PAGEUP, pagedown = VK.PAGEDOWN,
+  up = VK.UP, down = VK.DOWN, left = VK.LEFT, right = VK.RIGHT,
+  leftshift = VK.LSHIFT, rightshift = VK.RSHIFT,
+  leftcontrol = VK.LCTRL, rightcontrol = VK.RCTRL,
+  leftctrl = VK.LCTRL, rightctrl = VK.RCTRL,
+  leftalt = VK.LALT, rightalt = VK.RALT,
+  capslock = VK.CAPSLOCK, numlock = 0x90, scrolllock = 0x91,
+  zero = 0x30, one = 0x31, two = 0x32, three = 0x33, four = 0x34,
+  five = 0x35, six = 0x36, seven = 0x37, eight = 0x38, nine = 0x39,
+  keypadzero = 0x60, keypadone = 0x61, keypadtwo = 0x62, keypadthree = 0x63,
+  keypadfour = 0x64, keypadfive = 0x65, keypadsix = 0x66, keypadseven = 0x67,
+  keypadeight = 0x68, keypadnine = 0x69,
+  semicolon = 0xBA, equals = 0xBB, comma = 0xBC, minus = 0xBD,
+  period = 0xBE, slash = 0xBF, backquote = 0xC0,
+  leftbracket = 0xDB, backslash = 0xDC, rightbracket = 0xDD,
+}
+
+for i = 1, 12 do
+  NAME_TO_VK["f" .. i] = 0x6F + i
+end
+
+-- strips "Enum.KeyCode." / "KeyCode." / surrounding noise, lowercases
+local function normalizeName(name)
+  local s = tostring(name or "")
+  s = string.lower(s)
+  s = string.gsub(s, "^enum%.", "")
+  s = string.gsub(s, "^keycode%.", "")
+  s = string.gsub(s, "%s+", "")
+  return s
+end
+
+function KeyMap.nameToVK(name)
+  local n = normalizeName(name)
+  if n == "" then return nil end
+
+  local direct = NAME_TO_VK[n]
+  if direct then return direct end
+
+  -- a bare letter: "e" -> VK_E
+  if #n == 1 then
+    local byte = string.byte(n)
+    if byte and byte >= 97 and byte <= 122 then
+      return byte - 32
+    end
+    if byte and byte >= 48 and byte <= 57 then
+      return byte
+    end
+  end
+
+  return nil
+end
+
+-- ---------------------------------------------------------------------
+-- resolve whatever the bridge handed us
+-- ---------------------------------------------------------------------
+-- Order matters: EnumItem.Name is authoritative, because .Value is the
+-- ASCII-flavoured number that caused the original bug.
+function KeyMap.resolve(value, fallback)
+  if value == nil then return fallback end
+
+  -- EnumItem / userdata / table with a Name field
+  local n = nil
+  pcall(function() n = value.Name end)
+  if type(n) == "string" and n ~= "" then
+    local vk = KeyMap.nameToVK(n)
+    if vk then return vk end
+  end
+
+  -- EnumItem / number with a Value field
+  local v = nil
+  pcall(function() v = value.Value end)
+  if type(v) == "number" then
+    local vk = KeyMap.codeToVK(v)
+    if vk then return vk end
+  end
+
+  if type(value) == "number" then
+    return KeyMap.codeToVK(value) or fallback
+  end
+
+  if type(value) == "string" then
+    -- "Enum.KeyCode.E"
+    local tail = string.match(value, "([%w_]+)$")
+    return KeyMap.nameToVK(tail or value) or fallback
+  end
+
+  return fallback
+end
+
+-- "E (0x45)" for reports
+function KeyMap.describe(value)
+  local vk = KeyMap.resolve(value, nil)
+  if not vk then return "none" end
+
+  local name = tostring(value)
+  if type(value) == "number" then
+    name = string.format("#%d", value)
+  end
+  return string.format("%s -> 0x%02X", name, vk)
 end
 
 -- ======================================================================
@@ -616,16 +1084,9 @@ Input.Stats = Input.Stats or {
   lastAt  = 0,
 }
 
-Input.VK = {
-  A = 0x41, B = 0x42, C = 0x43, D = 0x44, E = 0x45, F = 0x46, G = 0x47,
-  H = 0x48, I = 0x49, J = 0x4A, K = 0x4B, L = 0x4C, M = 0x4D, N = 0x4E,
-  O = 0x4F, P = 0x50, Q = 0x51, R = 0x52, S = 0x53, T = 0x54, U = 0x55,
-  V = 0x56, W = 0x57, X = 0x58, Y = 0x59, Z = 0x5A,
-  SPACE = 0x20, ENTER = 0x0D, ESC = 0x1B, TAB = 0x09, SHIFT = 0x10,
-  CTRL = 0x11, ALT = 0x12, LEFT = 0x25, UP = 0x26, RIGHT = 0x27, DOWN = 0x28,
-  DIGIT1 = 0x31, DIGIT2 = 0x32, DIGIT3 = 0x33, DIGIT4 = 0x34, DIGIT5 = 0x35,
-  DIGIT6 = 0x36, DIGIT7 = 0x37, DIGIT8 = 0x38, DIGIT9 = 0x39, DIGIT0 = 0x30,
-}
+-- The canonical table lives in 12_keymap so prompt keys and movement keys
+-- cannot drift apart. Roblox KeyCode values are NOT VK codes; see that file.
+Input.VK = RR.KeyMap.VK
 
 local lastBlockLog = 0
 
@@ -730,6 +1191,22 @@ function Input.clickAt(worldPos, offsetX, offsetY)
   return Input.click()
 end
 
+-- Click a point that is already in viewport pixels, as returned by
+-- GuiObject.AbsolutePosition/AbsoluteSize. Matcha documents mousemoveabs
+-- as using the same pixel space as WorldToScreen and Camera.ViewportSize,
+-- which is exactly the space AbsolutePosition resolves to, so no window
+-- origin maths is needed.
+function Input.clickScreen(x, y)
+  if type(x) ~= "number" or type(y) ~= "number" then return false end
+  if x ~= x or y ~= y then return false end -- NaN guard
+
+  local vp = RR.Util.viewport()
+  if x < 2 or y < 2 or x > vp.X - 2 or y > vp.Y - 2 then return false end
+  if not Input.moveAbs(x, y) then return false end
+  wait(0.05)
+  return Input.click()
+end
+
 -- hold a key while a condition stays true, with a hard ceiling
 function Input.holdWhile(vk, condition, maxMs)
   if not Input.gate("holdWhile") then return false end
@@ -802,12 +1279,7 @@ local function camera()
 end
 
 local function viewport()
-  local cam = camera()
-  if not cam then return Vector2.new(1280, 720) end
-  local vp = nil
-  pcall(function() vp = cam.ViewportSize end)
-  if vp then return vp end
-  return Vector2.new(1280, 720)
+  return RR.Util.viewport()
 end
 
 local function project(pos)
@@ -875,7 +1347,29 @@ end
 -- ---------------------------------------------------------------------
 -- camera steering + walking
 -- ---------------------------------------------------------------------
-function Move.lookAt(target, tolPx, maxMs)
+-- Right-mouse drag is the only documented way to rotate the camera, and
+-- it is a *held* gesture: pressing and releasing it every frame makes
+-- the view jitter and wastes input. These two track the state so a walk
+-- can hold the drag for its whole duration.
+Move.aimHeld = false
+
+function Move.aimBegin()
+  if Move.aimHeld then return true end
+  local ok = pcall(function() mouse2press() end)
+  Move.aimHeld = ok and true or false
+  return Move.aimHeld
+end
+
+function Move.aimEnd()
+  if not Move.aimHeld then return false end
+  pcall(function() mouse2release() end)
+  Move.aimHeld = false
+  return true
+end
+
+-- keepHeld: leave the right button down so the caller can steer again
+-- without a press/release cycle around every correction.
+function Move.lookAt(target, tolPx, maxMs, keepHeld)
   tolPx = tolPx or 45
   maxMs = maxMs or 900
   if not RR.Input.focused() then return false, "not focused" end
@@ -884,7 +1378,7 @@ function Move.lookAt(target, tolPx, maxMs)
   local cx = vp.X / 2
   local cy = vp.Y / 2
 
-  local held = false
+  local held = Move.aimBegin()
   local deadline = tick() + (maxMs / 1000)
   local converged = false
   local searched = 0
@@ -899,20 +1393,12 @@ function Move.lookAt(target, tolPx, maxMs)
         converged = true
         break
       end
-      if not held then
-        pcall(function() mouse2press() end)
-        held = true
-      end
       -- cap the step so one frame cannot spin past the target
       local stepX = RR.Util.clamp(dx * 0.42, -140, 140)
       local stepY = RR.Util.clamp(dy * 0.42, -110, 110)
       RR.Input.moveRel(stepX, stepY)
     else
       -- behind us: drag sideways in fixed steps until it is on screen
-      if not held then
-        pcall(function() mouse2press() end)
-        held = true
-      end
       RR.Input.moveRel(150, 0)
       searched = searched + 1
       if searched > 24 then break end
@@ -920,10 +1406,10 @@ function Move.lookAt(target, tolPx, maxMs)
     wait(0.03)
   end
 
-  if held then
-    pcall(function() mouse2release() end)
+  if not keepHeld then
+    Move.aimEnd()
   end
-  return converged
+  return converged, held and nil or "right-mouse drag unavailable"
 end
 
 function Move.unstick()
@@ -951,22 +1437,34 @@ function Move.walkTo(target, tol, maxMs)
   local lastPos = RR.Util.charPos()
   local lastProgress = tick()
 
+  -- single exit so W is always released, even on the error paths
+  local function finish(ok, why)
+    RR.Input.keyUp(VK.W)
+    Move.aimEnd()
+    if ok then
+      Move.Stats.arrived = Move.Stats.arrived + 1
+    else
+      Move.Stats.failed = Move.Stats.failed + 1
+      Move.Stats.lastErr = why or "walk failed"
+    end
+    return ok, why
+  end
+
   RR.Input.keyDown(VK.W)
 
   while tick() < deadline do
     if not RR.Util.alive() then
-      RR.Input.keyUp(VK.W)
-      return false, "died"
+      return finish(false, "died")
     end
 
     local pos = RR.Util.charPos()
     if pos and (pos - target).Magnitude <= tol then
-      RR.Input.keyUp(VK.W)
-      Move.Stats.arrived = Move.Stats.arrived + 1
-      return true
+      return finish(true, "walk")
     end
 
-    Move.lookAt(target, 60, 260)
+    -- keep the right button held across corrections; releasing it every
+    -- loop made the camera stutter and the walk slower
+    Move.lookAt(target, 60, 260, true)
 
     if pos and lastPos then
       if (pos - lastPos).Magnitude < 0.35 then
@@ -983,14 +1481,12 @@ function Move.walkTo(target, tol, maxMs)
     wait(0.04)
   end
 
-  RR.Input.keyUp(VK.W)
-  Move.Stats.failed = Move.Stats.failed + 1
-  Move.Stats.lastErr = "walk timeout"
-  return false, "timeout"
+  return finish(false, "timeout")
 end
 
 function Move.stop()
   pcall(function() RR.Input.keyUp(VK.W) end)
+  pcall(function() Move.aimEnd() end)
   local hrp = RR.Util.hrp()
   if hrp then
     pcall(function() hrp.AssemblyLinearVelocity = Vector3.new(0, 0, 0) end)
@@ -1403,6 +1899,21 @@ end
 
 -- live prompt entries with anchor position, computed on demand so a
 -- prompt that moves with a customer is never stale
+local function readField(inst, key, default)
+  local v = nil
+  local ok = pcall(function() v = inst[key] end)
+  if ok and v ~= nil then return v end
+  return default
+end
+
+local function readEnumName(v)
+  if v == nil then return nil end
+  local n = nil
+  pcall(function() n = v.Name end)
+  if type(n) == "string" and n ~= "" then return n end
+  return string.match(tostring(v), "([%w_]+)$")
+end
+
 function World.livePrompts()
   local s = World.state
   local out = {}
@@ -1410,21 +1921,31 @@ function World.livePrompts()
   for i = 1, s.promptCount do
     local p = s.prompts[i]
     local anchorPos = World.posOf(p.anchor)
-    local enabled = nil
-    pcall(function() enabled = p.inst.Enabled end)
+    local enabled = readField(p.inst, "Enabled", true)
     if anchorPos and enabled ~= false then
+      local key = readField(p.inst, "KeyboardKeyCode", nil)
+      local maxDist = readField(p.inst, "MaxActivationDistance", 10)
+      if type(maxDist) ~= "number" or maxDist <= 0 then maxDist = 10 end
+
+      local hold = readField(p.inst, "HoldDuration", 0)
+      if type(hold) ~= "number" or hold < 0 then hold = 0 end
+
       out[#out + 1] = {
-        inst   = p.inst,
-        anchor = p.anchor,
-        pos    = anchorPos,
-        name   = readName(p.inst),
-        aname  = clean(readName(p.anchor)),
-        key    = nil,
-        hold   = nil,
+        inst    = p.inst,
+        anchor  = p.anchor,
+        pos     = anchorPos,
+        name    = readName(p.inst),
+        aname   = clean(readName(p.anchor)),
+        key     = key,
+        vk      = RR.KeyMap.resolve(key, nil),
+        hold    = hold,
+        maxDist = maxDist,
+        los     = readField(p.inst, "RequiresLineOfSight", true) == true,
+        clickable = readField(p.inst, "ClickablePrompt", false) == true,
+        exclName  = readEnumName(readField(p.inst, "Exclusivity", nil)) or "OnePerButton",
+        action  = tostring(readField(p.inst, "ActionText", "")),
+        object  = tostring(readField(p.inst, "ObjectText", "")),
       }
-      local e = out[#out]
-      pcall(function() e.key = p.inst.KeyboardKeyCode end)
-      pcall(function() e.hold = p.inst.HoldDuration end)
     end
   end
   return out
@@ -1436,6 +1957,78 @@ function World.summary()
     s.itemCount, s.promptCount, s.clickCount, s.buildMs)
 end
 
+-- ---------------------------------------------------------------------
+-- GUI buttons
+-- ---------------------------------------------------------------------
+-- Not part of the workspace scan: PlayerGui is rebuilt by client scripts
+-- every time a menu opens, so this is read on demand instead of cached.
+-- A button's label lives in .Text, and half these menus have no useful
+-- instance name, so both are searched.
+function World.guiButtons()
+  local out = {}
+  local lp = RR.Util.localPlayer()
+  if not lp then return out end
+
+  local pg = nil
+  pcall(function() pg = lp:FindFirstChildOfClass("PlayerGui") end)
+  if not pg then return out end
+
+  local list = nil
+  local ok = pcall(function() list = pg:GetDescendants() end)
+  if not ok or type(list) ~= "table" then return out end
+
+  for i = 1, #list do
+    local o = list[i]
+    local cls = nil
+    pcall(function() cls = o.ClassName end)
+    if cls == "TextButton" or cls == "ImageButton" then
+      if RR.Util.guiShown(o) then
+        local centre = RR.Util.guiCenter(o)
+        if centre then
+          local text, name = "", ""
+          pcall(function()
+            text = tostring(o.Text or "")
+            name = tostring(o.Name or "")
+          end)
+          out[#out + 1] = {
+            inst  = o,
+            cls   = cls,
+            name  = name,
+            text  = text,
+            pos   = centre,
+          }
+        end
+      end
+    end
+  end
+
+  return out
+end
+
+-- best-scoring visible button for a pattern; matches name and label
+function World.findGui(pattern, maxResults)
+  local inc, exc = World.parsePattern(pattern)
+  if #inc == 0 then return {} end
+  local list = World.guiButtons()
+  local hits = {}
+  for i = 1, #list do
+    local b = list[i]
+    local hay = string.lower(b.name .. " " .. b.text)
+    local sc = World.score(hay, inc, exc)
+    if sc then
+      b.score = sc
+      hits[#hits + 1] = b
+    end
+  end
+  table.sort(hits, function(a, b) return a.score > b.score end)
+  if maxResults and #hits > maxResults then
+    local cut = {}
+    for i = 1, maxResults do cut[i] = hits[i] end
+    return cut
+  end
+  return hits
+end
+
 -- ======================================================================
 -- 30_act.lua
 -- ======================================================================
@@ -1443,14 +2036,29 @@ end
      30_act : actions
 
      The only interaction surfaces that exist from outside the process:
+
        - ProximityPrompt, activated by standing close, facing it, and
          sending its own key code for its own hold duration
        - ClickDetector, activated by clicking the part on screen
-       - things that respond to a tool being equipped, via the number
-         keys, which only works if the tool is already in the hotbar
+       - a Tool in the hotbar, equipped with its number key
 
      Anything the game does through a RemoteEvent is out of reach, and
-     the place has exactly one RemoteEvent, so this is the whole toolkit.
+     this place has exactly one RemoteEvent, so this is the toolkit.
+
+     Two things here come straight out of the engine docs and were wrong
+     in the first build:
+
+     1. KeyboardKeyCode is an Enum.KeyCode, whose .Value is ASCII
+        (E = 101), not a Windows virtual-key code (E = 69). Pressing 101
+        hits numpad-5. src/12_keymap resolves this properly.
+
+     2. A prompt only triggers when the client has it *active*, and only
+        one prompt per key can be active at a time (Exclusivity defaults
+        to OnePerButton). If a second prompt is closer to the centre of
+        the screen, pressing the key activates that one instead. So a
+        press is only meaningful once we have aimed at ours.
+
+     Docs: ProximityPrompt, ProximityPromptExclusivity, ClickDetector.
      ================================================================== ]]
 
 local RR = _G.RR
@@ -1458,16 +2066,20 @@ local Act = RR.Act or {}
 RR.Act = Act
 
 Act.Stats = Act.Stats or {
-  prompts   = 0,
-  promptOk  = 0,
-  clicks    = 0,
-  clickOk   = 0,
-  lastErr   = "",
+  prompts     = 0,
+  promptOk    = 0,
+  promptMiss  = 0,
+  holdOk      = 0,
+  rivals      = 0,
+  clicks      = 0,
+  clickOk     = 0,
+  guiClicks   = 0,
+  lastErr     = "",
 }
 
-local VK = RR.Input.VK
+local VK = RR.KeyMap.VK
 
--- prompt field with a fallback
+-- prompt field with a fallback that never throws
 local function field(inst, key, default)
   local v = nil
   local ok = pcall(function() v = inst[key] end)
@@ -1475,23 +2087,238 @@ local function field(inst, key, default)
   return default
 end
 
-local function promptKeyVK(prompt)
-  local k = field(prompt, "KeyboardKeyCode", nil)
-  if type(k) == "number" and k > 0 then return k end
-  if type(k) == "userdata" or type(k) == "table" then
-    -- Enum.KeyCode -> number, if the bridge exposes .Value
-    local n = nil
-    pcall(function() n = k.Value end)
-    if type(n) == "number" and n > 0 then return n end
-  end
-  return VK.E
+-- enum item -> short name ("OnePerButton"), without assuming .Name exists
+local function enumName(v)
+  if v == nil then return nil end
+  local n = nil
+  pcall(function() n = v.Name end)
+  if type(n) == "string" and n ~= "" then return n end
+  local s = tostring(v)
+  local tail = string.match(s, "([%w_]+)$")
+  if tail then return tail end
+  return nil
 end
 
+-- ---------------------------------------------------------------------
+-- reading a prompt
+-- ---------------------------------------------------------------------
+-- Everything a press depends on, read once per attempt.
+function Act.flags(prompt)
+  local key = field(prompt, "KeyboardKeyCode", nil)
+
+  local hold = field(prompt, "HoldDuration", 0)
+  if type(hold) ~= "number" or hold < 0 then hold = 0 end
+
+  local maxDist = field(prompt, "MaxActivationDistance", 10)
+  if type(maxDist) ~= "number" or maxDist <= 0 then maxDist = 10 end
+
+  local excl = field(prompt, "Exclusivity", nil)
+
+  return {
+    key         = key,
+    vk          = RR.KeyMap.resolve(key, VK.E),
+    hold        = hold,
+    maxDist     = maxDist,
+    los         = field(prompt, "RequiresLineOfSight", true) == true,
+    clickable   = field(prompt, "ClickablePrompt", false) == true,
+    enabled     = field(prompt, "Enabled", true) ~= false,
+    exclusivity = excl,
+    exclName    = enumName(excl) or "OnePerButton",
+    actionText  = field(prompt, "ActionText", ""),
+    objectText  = field(prompt, "ObjectText", ""),
+  }
+end
+
+-- how far a world position is from the middle of the screen, in pixels.
+-- Nearer means "this is the prompt the client will activate".
+function Act.focusScore(pos)
+  return RR.Util.focusScore(pos)
+end
+
+-- ---------------------------------------------------------------------
+-- ground truth: ProximityPromptService
+-- ---------------------------------------------------------------------
+-- PromptShown / PromptHidden are client-side signals that fire exactly
+-- when a prompt becomes the active one. If the executor surfaces them we
+-- stop guessing which prompt owns the key and simply ask.
+Act.watching = Act.watching or false
+Act.active = Act.active or nil
+Act.lastTriggered = Act.lastTriggered or nil
+
+function Act.watch()
+  if Act.watching then return true end
+
+  local svc = nil
+  pcall(function()
+    local pp = game:GetService("ProximityPromptService")
+    svc = pp
+  end)
+  if not svc then return false end
+
+  local conns = {}
+  local ok = pcall(function()
+    local c1 = svc.PromptShown:Connect(function(prompt)
+      Act.active = prompt
+      Act.shownAt = tick()
+    end)
+    if c1 then conns[#conns + 1] = c1 end
+
+    local c2 = svc.PromptHidden:Connect(function(prompt)
+      if Act.active == prompt then Act.active = nil end
+    end)
+    if c2 then conns[#conns + 1] = c2 end
+
+    -- PromptTriggered is the authoritative "the press worked" signal
+    local c3 = svc.PromptTriggered:Connect(function(prompt)
+      Act.lastTriggered = prompt
+      Act.triggeredAt = tick()
+    end)
+    if c3 then conns[#conns + 1] = c3 end
+  end)
+
+  Act.conns = conns
+  Act.watching = ok
+  if ok then RR.log("prompt service observed: activation is verifiable") end
+  return ok
+end
+
+function Act.unwatch()
+  local conns = Act.conns or {}
+  for i = 1, #conns do
+    pcall(function() conns[i]:Disconnect() end)
+  end
+  Act.conns = {}
+  Act.watching = false
+  Act.active = nil
+  Act.lastTriggered = nil
+end
+
+-- true / false when the service is available, nil when we do not know
+function Act.isActive(p)
+  if not Act.watching or not p then return nil end
+  local inst = p.inst or p
+  return Act.active == inst
+end
+
+function Act.activeName()
+  local a = Act.active
+  if not a then return "none" end
+  local n = nil
+  pcall(function() n = a:GetFullName() end)
+  return n or "?"
+end
+
+-- one line for the report and the menu: whether activation is observed
+-- or guessed
+function Act.watchSummary()
+  if Act.watching then
+    return "observed (active: " .. Act.activeName() .. ")"
+  end
+  return "not exposed - using camera heuristics"
+end
+
+-- ---------------------------------------------------------------------
+-- competing prompts
+-- ---------------------------------------------------------------------
+-- Roblox shows at most one prompt per key (OnePerButton), or one prompt
+-- in total (OneGlobally). Either way the camera decides the winner, and
+-- the loser swallows the key press. This finds the prompts that would
+-- beat ours right now, so the caller can aim again instead of pressing
+-- into the void.
+function Act.competitors(p, f, anchorPos)
+  local out = { count = 0, best = nil, bestScore = nil, mine = math.huge }
+  if not p or not anchorPos then return out end
+
+  local list = RR.World.livePrompts()
+  if #list == 0 then return out end
+
+  local me = RR.Util.charPos()
+  if not me then return out end
+
+  out.mine = RR.Util.focusScore(anchorPos)
+  if out.mine == math.huge then return out end
+
+  for i = 1, #list do
+    local q = list[i]
+    if q.inst ~= p.inst then
+      local sameKey = (q.vk == nil) or (q.vk == f.vk)
+      -- OneGlobally: any prompt can take the slot, whatever its key
+      local relevant = sameKey or (f.exclName == "OneGlobally")
+      -- AlwaysShow never takes anything away from anyone
+      if f.exclName == "AlwaysShow" then relevant = false end
+
+      if relevant then
+        local d = (me - q.pos).Magnitude
+        local qmax = q.maxDist or 10
+        if d <= qmax then
+          local score = RR.Util.focusScore(q.pos)
+          if score < out.mine then
+            out.count = out.count + 1
+            if not out.bestScore or score < out.bestScore then
+              out.best = q
+              out.bestScore = score
+            end
+          end
+        end
+      end
+    end
+  end
+
+  return out
+end
+
+-- ---------------------------------------------------------------------
+-- pressing
+-- ---------------------------------------------------------------------
+-- The documented path: real key input, real hold duration.
+function Act.pressKey(f)
+  local holdMs = (f.hold * 1000) + 90
+  if not RR.Input.hold(f.vk, holdMs, "prompt") then
+    return false, "input gate closed"
+  end
+  return true, "key"
+end
+
+-- The documented-but-unverified path: ProximityPrompt:InputHoldBegin()
+-- exists on the class and is what the default prompt UI calls when you
+-- click a ClickablePrompt. Whether an externally emulated client turns
+-- that signal into a trigger is build-dependent, so this is opt-in and
+-- always followed by the caller's verify function.
+function Act.promptHold(p, f)
+  if not p or not p.inst then return false, "no prompt" end
+
+  local began = pcall(function() p.inst:InputHoldBegin() end)
+  if not began then return false, "InputHoldBegin unavailable" end
+
+  wait((f.hold + 0.14))
+  pcall(function() p.inst:InputHoldEnd() end)
+
+  Act.Stats.holdOk = Act.Stats.holdOk + 1
+  return true, "inputHold"
+end
+
+-- ClickablePrompt is a second documented activation path: the prompt's
+-- own UI is a button. We cannot see that UI, but the click lands on the
+-- anchor part, which is where the UI hovers.
+function Act.promptClick(p, opts)
+  if not p or not p.anchor then return false, "no anchor" end
+  local pos = p.pos or RR.World.posOf(p.anchor)
+  if not pos then return false, "no position" end
+  return Act.clickPart(p.anchor, { offsetY = opts and opts.offsetY })
+end
+
+-- ---------------------------------------------------------------------
+-- the main entry point
+-- ---------------------------------------------------------------------
 -- Activate one prompt. opts:
---   approach  : false to skip walking (default true)
---   tol       : arrival tolerance in studs (default 4)
---   verify    : function(inst) -> boolean, polled after the press
---   verifyMs  : how long to poll verify (default 800)
+--   approach     : false to skip walking (default true)
+--   tol          : arrival tolerance in studs (default 6)
+--   timeout      : seconds allowed for the approach (default 12)
+--   aim          : false to skip camera aiming (default true)
+--   strict       : true to give up when a rival prompt wins the slot
+--   method       : "key" (default) | "hold" | "click"
+--   verify       : function(inst) -> boolean, polled after the press
+--   verifyMs     : how long to poll verify (default 900)
 function Act.prompt(p, opts)
   opts = opts or {}
   if not p or not p.inst then return false, "no prompt" end
@@ -1503,10 +2330,15 @@ function Act.prompt(p, opts)
     return false, Act.Stats.lastErr
   end
 
-  local maxDist = field(p.inst, "MaxActivationDistance", 10)
-  if type(maxDist) ~= "number" or maxDist <= 0 then maxDist = 10 end
-  local want = math.min(maxDist * 0.75, opts.tol or 6)
+  local f = Act.flags(p.inst)
 
+  if f.enabled == false then
+    Act.Stats.lastErr = "prompt is disabled"
+    return false, Act.Stats.lastErr
+  end
+
+  -- 1. get in range -------------------------------------------------
+  local want = math.min(f.maxDist * 0.75, opts.tol or 6)
   if opts.approach ~= false then
     local pos = RR.Util.charPos()
     if not pos or (pos - anchorPos).Magnitude > want then
@@ -1518,47 +2350,118 @@ function Act.prompt(p, opts)
     end
   end
 
-  -- face it, otherwise the prompt is not focused and E does nothing
-  RR.Move.lookAt(anchorPos + Vector3.new(0, 1.5, 0), 70, 700)
+  -- 2. aim ----------------------------------------------------------
+  -- Required for two independent reasons: a prompt with
+  -- RequiresLineOfSight (default true) is hidden when something blocks
+  -- the camera, and the client picks the on-screen prompt by camera
+  -- direction, not by distance.
+  local aimed = true
+  if opts.aim ~= false then
+    aimed = RR.Move.lookAt(anchorPos + Vector3.new(0, 1.5, 0), 70, 800)
+  end
 
-  local vk = promptKeyVK(p.inst)
-  local hold = field(p.inst, "HoldDuration", 0)
-  if type(hold) ~= "number" or hold < 0 then hold = 0 end
-  local holdMs = (hold * 1000) + 90
+  if f.los and not aimed then
+    -- one more, wider sweep before giving up on line of sight
+    aimed = RR.Move.lookAt(anchorPos + Vector3.new(0, 1.5, 0), 110, 600)
+    if not aimed then
+      Act.Stats.promptMiss = Act.Stats.promptMiss + 1
+      Act.Stats.lastErr = "prompt out of view (RequiresLineOfSight)"
+      return false, Act.Stats.lastErr
+    end
+  end
 
-  if not RR.Input.hold(vk, holdMs, "prompt") then
-    Act.Stats.lastErr = "input gate closed"
+  -- 3. make sure the key is not going to hit a neighbour ------------
+  -- The service, when available, is authoritative. Otherwise fall back
+  -- to the camera-centre heuristic, which is what the client uses when
+  -- Exclusivity is OnePerButton or OneGlobally.
+  if Act.watching then
+    if not Act.isActive(p) then
+      RR.Move.lookAt(anchorPos + Vector3.new(0, 1.5, 0), 40, 600)
+    end
+    if not Act.isActive(p) then
+      Act.Stats.promptMiss = Act.Stats.promptMiss + 1
+      Act.Stats.lastErr = "not the active prompt (active: " .. Act.activeName() .. ")"
+      return false, Act.Stats.lastErr
+    end
+  elseif opts.strict then
+    local rivals = Act.competitors(p, f, anchorPos)
+    if rivals.count > 0 then
+      RR.Move.lookAt(anchorPos + Vector3.new(0, 1.5, 0), 40, 500)
+      rivals = Act.competitors(p, f, anchorPos)
+      if rivals.count > 0 then
+        Act.Stats.rivals = Act.Stats.rivals + 1
+        local who = rivals.best and rivals.best.aname or "?"
+        Act.Stats.lastErr = "another prompt owns the key: " .. tostring(who)
+        return false, Act.Stats.lastErr
+      end
+    end
+  end
+
+  -- 4. press --------------------------------------------------------
+  local method = opts.method or RR.Cfg.get("promptMethod", "key")
+  local pressed, how
+
+  if method == "hold" then
+    pressed, how = Act.promptHold(p, f)
+    if not pressed then
+      pressed, how = Act.pressKey(f)
+    end
+  elseif method == "click" then
+    pressed, how = Act.promptClick(p, opts)
+    if not pressed then
+      pressed, how = Act.pressKey(f)
+    end
+  else
+    pressed, how = Act.pressKey(f)
+  end
+
+  if not pressed then
+    Act.Stats.lastErr = tostring(how)
     return false, Act.Stats.lastErr
   end
   wait(0.08)
 
+  -- 5. confirm ------------------------------------------------------
+  -- A PromptTriggered observation beats any heuristic: the game said so.
+  if Act.watching and Act.lastTriggered == p.inst then
+    Act.Stats.promptOk = Act.Stats.promptOk + 1
+    return true, "triggered"
+  end
+
   if opts.verify then
-    local deadline = tick() + ((opts.verifyMs or 800) / 1000)
+    local deadline = tick() + ((opts.verifyMs or 900) / 1000)
     while tick() < deadline do
+      if Act.watching and Act.lastTriggered == p.inst then
+        Act.Stats.promptOk = Act.Stats.promptOk + 1
+        return true, "triggered"
+      end
       local ok, res = pcall(opts.verify, p.inst)
       if ok and res == true then
         Act.Stats.promptOk = Act.Stats.promptOk + 1
-        return true, "verified"
+        return true, how or "verified"
       end
       wait(0.06)
     end
-    Act.Stats.lastErr = "no confirmation"
+    Act.Stats.promptMiss = Act.Stats.promptMiss + 1
+    Act.Stats.lastErr = "pressed (" .. tostring(how) .. ") but no confirmation"
     return false, Act.Stats.lastErr
   end
 
   Act.Stats.promptOk = Act.Stats.promptOk + 1
-  return true, "pressed"
+  return true, how or "pressed"
 end
 
--- Click a world position
+-- ---------------------------------------------------------------------
+-- clicking
+-- ---------------------------------------------------------------------
 function Act.clickPart(part, opts)
   opts = opts or {}
-  if not part then return false, "no part" end
-  local pos = RR.World.posOf(part)
+  -- accept either an instance or a position
+  local pos = opts.pos or RR.World.posOf(part)
   if not pos then return false, "no position" end
 
-  local ok = RR.Input.clickAt(pos, opts.offsetX, opts.offsetY)
   Act.Stats.clicks = Act.Stats.clicks + 1
+  local ok = RR.Input.clickAt(pos, opts.offsetX, opts.offsetY)
   if ok then
     Act.Stats.clickOk = Act.Stats.clickOk + 1
     return true, "clicked"
@@ -1567,7 +2470,7 @@ function Act.clickPart(part, opts)
   return false, Act.Stats.lastErr
 end
 
--- ClickDetector: walk into range first, then click the parent part
+-- ClickDetector: walk into range first, then click the parent part.
 function Act.clickDetector(entry, opts)
   opts = opts or {}
   if not entry or not entry.anchor then return false, "no detector" end
@@ -1589,20 +2492,68 @@ function Act.clickDetector(entry, opts)
   return Act.clickPart(entry.anchor, opts)
 end
 
+-- ---------------------------------------------------------------------
+-- GUI buttons
+-- ---------------------------------------------------------------------
+-- Shop, cooking and upgrade menus are almost always TextButtons in
+-- PlayerGui. A real click at the button's AbsolutePosition is
+-- indistinguishable from the player's own click: the client's own code
+-- receives it and does whatever it would have done. This is the one
+-- interaction path that works for systems with no prompt and no part.
+function Act.clickGui(button, opts)
+  opts = opts or {}
+  if not button or not button.inst then return false, "no button" end
+  if not RR.Util.guiShown(button.inst) then return false, "button not visible" end
+
+  local centre = button.pos or RR.Util.guiCenter(button.inst)
+  if not centre then return false, "button has no size" end
+
+  Act.Stats.clicks = Act.Stats.clicks + 1
+  Act.Stats.guiClicks = (Act.Stats.guiClicks or 0) + 1
+
+  if not RR.Input.clickScreen(centre.X, centre.Y) then
+    Act.Stats.lastErr = "gui click off screen or gate closed"
+    return false, Act.Stats.lastErr
+  end
+  Act.Stats.clickOk = Act.Stats.clickOk + 1
+
+  if opts.verify then
+    local deadline = tick() + ((opts.verifyMs or 800) / 1000)
+    while tick() < deadline do
+      local ok, res = pcall(opts.verify)
+      if ok and res == true then return true, "gui" end
+      wait(0.05)
+    end
+    Act.Stats.lastErr = "clicked gui but no confirmation"
+    return false, Act.Stats.lastErr
+  end
+
+  return true, "gui"
+end
+
+-- click the best visible button whose name or label matches a pattern
+function Act.clickGuiNamed(pattern, opts)
+  local hits = RR.World.findGui(pattern)
+  if #hits == 0 then
+    return false, "no visible button matching " .. tostring(pattern)
+  end
+  return Act.clickGui(hits[1], opts)
+end
+
 -- Is a prompt currently usable from where we stand?
 function Act.promptInRange(p)
   if not p then return false end
   local me = RR.Util.charPos()
   local pos = p.pos or RR.World.posOf(p.anchor)
   if not me or not pos then return false end
-  local maxDist = field(p.inst, "MaxActivationDistance", 10)
-  if type(maxDist) ~= "number" or maxDist <= 0 then maxDist = 10 end
-  return (me - pos).Magnitude <= maxDist
+  local f = Act.flags(p.inst)
+  return (me - pos).Magnitude <= f.maxDist
 end
 
 function Act.summary()
   local s = Act.Stats
-  return string.format("prompts %d/%d  clicks %d/%d", s.promptOk, s.prompts, s.clickOk, s.clicks)
+  return string.format("prompts %d/%d miss=%d rivals=%d  clicks %d/%d gui=%d",
+    s.promptOk, s.prompts, s.promptMiss, s.rivals, s.clickOk, s.clicks, s.guiClicks or 0)
 end
 
 -- ======================================================================
@@ -2238,6 +3189,7 @@ function RR.dumpReport()
   lines[#lines + 1] = ""
   lines[#lines + 1] = "== interaction =="
   lines[#lines + 1] = RR.Act.summary()
+  lines[#lines + 1] = "activation  : " .. RR.Act.watchSummary()
   lines[#lines + 1] = RR.Input.summary()
   lines[#lines + 1] = ""
   lines[#lines + 1] = "== jobs =="
@@ -2274,6 +3226,7 @@ local function buildUI()
   UI.addLabel(function() return "world   : " .. W.summary() end)
   UI.addLabel(function() return "move    : " .. RR.Move.summary() end)
   UI.addLabel(function() return "interact: " .. RR.Act.summary() end)
+  UI.addLabel(function() return "prompts : " .. RR.Act.watchSummary() end)
   UI.addLabel(function() return "input   : " .. RR.Input.summary() end)
   UI.addLabel(function()
     local d = Jobs.Stats
@@ -2324,6 +3277,7 @@ function RR.stop()
   RR.stopped = true
   Jobs.paused = true
   pcall(function() RR.Move.stop() end)
+  pcall(function() RR.Act.unwatch() end)
   pcall(function() RR.Input.releaseAll() end)
   pcall(function() RR.Cfg.save() end)
   pcall(function() RR.Log.flush() end)
@@ -2342,6 +3296,11 @@ local function boot()
 
   pcall(function() RR.Caps.probe() end)
   pcall(function() W.scan() end)
+
+  -- Observe ProximityPromptService before the first press. When the
+  -- executor exposes it, "which prompt is active" and "did the press
+  -- land" stop being heuristics and become events.
+  pcall(function() RR.Act.watch() end)
 
   buildUI()
 

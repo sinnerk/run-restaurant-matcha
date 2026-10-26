@@ -48,7 +48,35 @@ most of the limitations below.
 `error()` **prints, it does not raise**. Use `assert(false, msg)` for a catchable fault.
 
 `mousemoveabs` uses the same pixel space as `WorldToScreen` and `Camera.ViewportSize`,
-so a projection can be fed straight into it.
+so a projection can be fed straight into it — and the same space as
+`GuiObject.AbsolutePosition`, so GUI buttons can be clicked directly (see
+`Input.clickScreen`).
+
+### KeyCode is not a VK code
+
+`keypress` / `keyrelease` take **Windows virtual-key codes**. A Roblox
+`Enum.KeyCode` is not one: it reuses ASCII, so `Enum.KeyCode.E.Value == 101`, while
+`VK_E == 69`. Pressing `101` hits numpad-5. Letters are `97..122` (`'a'..'z'`) and map
+to VK `65..90`; digits are identical (`48..57`); arrows are `273..276` → `0x26/0x28/
+0x27/0x25`; `F1..F12` are `282..293` → `0x70..0x7B`. `src/12_keymap.lua` owns the
+conversion, and `KeyMap.resolve` prefers `.Name` over `.Value` because the name is
+authoritative.
+
+## Instance property reads — probed, not assumed
+
+Only the classes listed below are documented. A `ProximityPrompt`, `ClickDetector`,
+`Tool` or `ScreenGui` is *not* in that list, so no property of one is guaranteed. The
+rule in this project is:
+
+1. read every property inside `pcall`,
+2. fall back to the **engine default** when the read fails (E, 0 s hold, 10 studs,
+   `RequiresLineOfSight = true`, `Exclusivity = OnePerButton`),
+3. record what was actually readable in the capability report so the first run tells
+   you the truth.
+
+`10_caps.lua` follows that pattern for prompts, tools and `PlayerGui`. An absent
+service (`ProximityPromptService`, `Backpack`) is treated as "not exposed" and every
+caller has a fallback path, so a build that exposes less still works.
 
 ## Scheduler
 
@@ -121,6 +149,9 @@ connection failure returns `""`. Guard on `body ~= ""`.
 | `Lighting` | Not exposed as a class. |
 | `Player.CharacterAdded` | Not documented — poll `Player.Character` instead. |
 | `Ray`, `UDim`, `UDim2` | Not implemented datatypes. |
+| `ProximityPromptService` | Not documented. `Act.watch()` tries it via `game:GetService` and falls back to geometry when the call fails. |
+| `Tool.Activate` | Not documented. `10_caps` reports whether the method exists on a backpack tool. |
+| `ProximityPrompt:InputHoldBegin()` | Class method exists in the engine; whether an emulated client turns it into a trigger is **unverified**, so it is an opt-in path. |
 
 Datatypes that do exist: **Vector3, CFrame, Vector2, Color3**. Nothing else is documented.
 There is no `CFrame.lookAt` / `CFrame.LookAt` constructor; `Camera:lookAt` is the only

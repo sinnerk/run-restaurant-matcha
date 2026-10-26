@@ -339,6 +339,21 @@ end
 
 -- live prompt entries with anchor position, computed on demand so a
 -- prompt that moves with a customer is never stale
+local function readField(inst, key, default)
+  local v = nil
+  local ok = pcall(function() v = inst[key] end)
+  if ok and v ~= nil then return v end
+  return default
+end
+
+local function readEnumName(v)
+  if v == nil then return nil end
+  local n = nil
+  pcall(function() n = v.Name end)
+  if type(n) == "string" and n ~= "" then return n end
+  return string.match(tostring(v), "([%w_]+)$")
+end
+
 function World.livePrompts()
   local s = World.state
   local out = {}
@@ -346,21 +361,31 @@ function World.livePrompts()
   for i = 1, s.promptCount do
     local p = s.prompts[i]
     local anchorPos = World.posOf(p.anchor)
-    local enabled = nil
-    pcall(function() enabled = p.inst.Enabled end)
+    local enabled = readField(p.inst, "Enabled", true)
     if anchorPos and enabled ~= false then
+      local key = readField(p.inst, "KeyboardKeyCode", nil)
+      local maxDist = readField(p.inst, "MaxActivationDistance", 10)
+      if type(maxDist) ~= "number" or maxDist <= 0 then maxDist = 10 end
+
+      local hold = readField(p.inst, "HoldDuration", 0)
+      if type(hold) ~= "number" or hold < 0 then hold = 0 end
+
       out[#out + 1] = {
-        inst   = p.inst,
-        anchor = p.anchor,
-        pos    = anchorPos,
-        name   = readName(p.inst),
-        aname  = clean(readName(p.anchor)),
-        key    = nil,
-        hold   = nil,
+        inst    = p.inst,
+        anchor  = p.anchor,
+        pos     = anchorPos,
+        name    = readName(p.inst),
+        aname   = clean(readName(p.anchor)),
+        key     = key,
+        vk      = RR.KeyMap.resolve(key, nil),
+        hold    = hold,
+        maxDist = maxDist,
+        los     = readField(p.inst, "RequiresLineOfSight", true) == true,
+        clickable = readField(p.inst, "ClickablePrompt", false) == true,
+        exclName  = readEnumName(readField(p.inst, "Exclusivity", nil)) or "OnePerButton",
+        action  = tostring(readField(p.inst, "ActionText", "")),
+        object  = tostring(readField(p.inst, "ObjectText", "")),
       }
-      local e = out[#out]
-      pcall(function() e.key = p.inst.KeyboardKeyCode end)
-      pcall(function() e.hold = p.inst.HoldDuration end)
     end
   end
   return out
@@ -370,4 +395,76 @@ function World.summary()
   local s = World.state
   return string.format("%d items, %d prompts, %d clicks, scan %.0f ms",
     s.itemCount, s.promptCount, s.clickCount, s.buildMs)
+end
+
+-- ---------------------------------------------------------------------
+-- GUI buttons
+-- ---------------------------------------------------------------------
+-- Not part of the workspace scan: PlayerGui is rebuilt by client scripts
+-- every time a menu opens, so this is read on demand instead of cached.
+-- A button's label lives in .Text, and half these menus have no useful
+-- instance name, so both are searched.
+function World.guiButtons()
+  local out = {}
+  local lp = RR.Util.localPlayer()
+  if not lp then return out end
+
+  local pg = nil
+  pcall(function() pg = lp:FindFirstChildOfClass("PlayerGui") end)
+  if not pg then return out end
+
+  local list = nil
+  local ok = pcall(function() list = pg:GetDescendants() end)
+  if not ok or type(list) ~= "table" then return out end
+
+  for i = 1, #list do
+    local o = list[i]
+    local cls = nil
+    pcall(function() cls = o.ClassName end)
+    if cls == "TextButton" or cls == "ImageButton" then
+      if RR.Util.guiShown(o) then
+        local centre = RR.Util.guiCenter(o)
+        if centre then
+          local text, name = "", ""
+          pcall(function()
+            text = tostring(o.Text or "")
+            name = tostring(o.Name or "")
+          end)
+          out[#out + 1] = {
+            inst  = o,
+            cls   = cls,
+            name  = name,
+            text  = text,
+            pos   = centre,
+          }
+        end
+      end
+    end
+  end
+
+  return out
+end
+
+-- best-scoring visible button for a pattern; matches name and label
+function World.findGui(pattern, maxResults)
+  local inc, exc = World.parsePattern(pattern)
+  if #inc == 0 then return {} end
+  local list = World.guiButtons()
+  local hits = {}
+  for i = 1, #list do
+    local b = list[i]
+    local hay = string.lower(b.name .. " " .. b.text)
+    local sc = World.score(hay, inc, exc)
+    if sc then
+      b.score = sc
+      hits[#hits + 1] = b
+    end
+  end
+  table.sort(hits, function(a, b) return a.score > b.score end)
+  if maxResults and #hits > maxResults then
+    local cut = {}
+    for i = 1, maxResults do cut[i] = hits[i] end
+    return cut
+  end
+  return hits
 end
