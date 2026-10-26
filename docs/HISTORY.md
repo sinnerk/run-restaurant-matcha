@@ -47,7 +47,7 @@ executed rather than reviewed:
 
 1. **`12_keymap`** translates `Enum.KeyCode` → VK and is unit-tested against every letter,
    digit, arrow and function key.
-2. **`tests/` + `run-tests.ps1`** run the real modules in a real Luau VM (44 assertions).
+2. **`tests/` + `run-tests.ps1`** run the real modules in a real Luau VM (48 assertions).
    Parsing was never proof; now arithmetic, exclusivity and click routing are checked.
 3. **Activation is observed.** `Act.watch` connects to `ProximityPromptService` when the
    build exposes it, so "the prompt triggered" replaces "the key was pressed".

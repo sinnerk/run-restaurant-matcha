@@ -156,9 +156,9 @@ named NPCs, the shops, the one RemoteEvent.
 
 **Proven by execution:** `src/` is parsed as Lua 5.1 by `check.ps1` (13 files), linted by
 `tools/lint.js` (forbidden APIs, silent globals, chunk-local budget), and the seven
-client-independent modules are executed in a real Luau VM by `run-tests.ps1` — 44
-assertions covering key mapping, projection, prompt flags, exclusivity, GUI geometry and
-click routing. A green run means the logic is correct, not just parseable.
+client-independent modules are executed in a real Luau VM by `run-tests.ps1` — 48
+assertions covering key mapping, projection, prompt flags, exclusivity, GUI geometry,
+click routing and observed prompt activation. A green run means the logic is correct, not just parseable.
 
 **Not yet proven:** none of it has run inside Roblox. `10_caps` exists to convert the
 remaining assumptions into facts on the first launch.

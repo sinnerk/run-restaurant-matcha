@@ -341,8 +341,18 @@ function Act.prompt(p, opts)
   -- to the camera-centre heuristic, which is what the client uses when
   -- Exclusivity is OnePerButton or OneGlobally.
   if Act.watching then
-    if not Act.isActive(p) then
-      RR.Move.lookAt(anchorPos + Vector3.new(0, 1.5, 0), 40, 600)
+    -- PromptShown fires when the UI updates, which lags the camera by a
+    -- frame or two. Sampling once makes a perfect aim look like a losing
+    -- contest, so poll, and re-aim once if it has not flipped yet.
+    local deadline = tick() + 0.6
+    local reaimed = false
+    while tick() < deadline do
+      if Act.isActive(p) then break end
+      if not reaimed and (deadline - tick()) < 0.35 then
+        RR.Move.lookAt(anchorPos + Vector3.new(0, 1.5, 0), 40, 500)
+        reaimed = true
+      end
+      wait(0.05)
     end
     if not Act.isActive(p) then
       Act.Stats.promptMiss = Act.Stats.promptMiss + 1
@@ -365,6 +375,7 @@ function Act.prompt(p, opts)
 
   -- 4. press --------------------------------------------------------
   local method = opts.method or RR.Cfg.get("promptMethod", "key")
+  local pressAt = tick()
   local pressed, how
 
   if method == "hold" then
@@ -388,19 +399,35 @@ function Act.prompt(p, opts)
   wait(0.08)
 
   -- 5. confirm ------------------------------------------------------
-  -- A PromptTriggered observation beats any heuristic: the game said so.
-  if Act.watching and Act.lastTriggered == p.inst then
-    Act.Stats.promptOk = Act.Stats.promptOk + 1
-    return true, "triggered"
+  -- With the prompt service observed, a trigger is the engine saying the
+  -- press landed. A press that produces no trigger is a failure, not a
+  -- success with a caveat: the key went somewhere else.
+  if Act.watching then
+    local deadline = tick() + 0.65
+    while tick() < deadline do
+      if Act.lastTriggered == p.inst and (Act.triggeredAt or 0) >= pressAt then
+        Act.Stats.promptOk = Act.Stats.promptOk + 1
+        return true, "triggered"
+      end
+      wait(0.04)
+    end
+
+    if opts.verify then
+      local ok, res = pcall(opts.verify, p.inst)
+      if ok and res == true then
+        Act.Stats.promptOk = Act.Stats.promptOk + 1
+        return true, how or "verified"
+      end
+    end
+
+    Act.Stats.promptMiss = Act.Stats.promptMiss + 1
+    Act.Stats.lastErr = "pressed (" .. tostring(how) .. ") but the prompt did not trigger"
+    return false, Act.Stats.lastErr
   end
 
   if opts.verify then
     local deadline = tick() + ((opts.verifyMs or 900) / 1000)
     while tick() < deadline do
-      if Act.watching and Act.lastTriggered == p.inst then
-        Act.Stats.promptOk = Act.Stats.promptOk + 1
-        return true, "triggered"
-      end
       local ok, res = pcall(opts.verify, p.inst)
       if ok and res == true then
         Act.Stats.promptOk = Act.Stats.promptOk + 1

@@ -155,7 +155,7 @@ Build, check and test:
 powershell -ExecutionPolicy Bypass -File build.ps1     # src -> dist
 powershell -ExecutionPolicy Bypass -File check.ps1     # parse every file as Lua 5.1
 node tools\lint.js                                     # forbidden APIs + silent globals
-powershell -ExecutionPolicy Bypass -File run-tests.ps1 # execute src in Luau, 44 assertions
+powershell -ExecutionPolicy Bypass -File run-tests.ps1 # execute src in Luau, 48 assertions
 ```
 
 `check.ps1` parses with a Lua 5.1 grammar and `tools/lint.js` fails the build on
@@ -194,7 +194,7 @@ the right answers — not just that the files parse.
 
 | Version | Notes |
 |---|---|
-| v5.1.0 | Fixes the prompt key bug (`Enum.KeyCode` is ASCII, not VK — v5.0.0 pressed numpad keys). Adds `12_keymap`, prompt activation observed through `ProximityPromptService`, exclusivity-aware presses, held camera drag during walks, GUI button scanning and clicking, a Luau test suite (44 assertions), `tools/DumpScripts.lua`, and the engine/language notes. |
+| v5.1.0 | Fixes the prompt key bug (`Enum.KeyCode` is ASCII, not VK — v5.0.0 pressed numpad keys). Adds `12_keymap`, prompt activation observed through `ProximityPromptService`, exclusivity-aware presses, held camera drag during walks, GUI button scanning and clicking, a Luau test suite (48 assertions), `tools/DumpScripts.lua`, and the engine/language notes. |
 | v5.0.0 | Module rewrite. Capability probe, dual-mode movement, sliced world scan, scheduler, Drawing menu, eight confirmed world jobs. Restaurant logic deliberately not faked. |
 | v4.2.0 | Separate repo (`sinnerk/roblox-matcha-autofarm`). Prompt-first targeting, drawn GUI, capability probe, telemetry. Superseded by this repo. |
 | v3.0 | `UI.AddTab` based, threw on load. Kept in `legacy/`. |

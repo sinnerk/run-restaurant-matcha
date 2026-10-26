@@ -468,7 +468,107 @@ check("clicking a hidden button is refused", function()
 end)
 
 -- ---------------------------------------------------------------------
--- 9. stats surface
+-- 9. Act.prompt when the prompt service is observable
+-- ---------------------------------------------------------------------
+describe("Act.prompt - observed activation")
+
+local function fakePrompt()
+  local anchor = makeInstance("Part", "Stove", { Position = Vector3.new(0, 0, 0) })
+  local prompt = makeInstance("ProximityPrompt", "ProximityPrompt", {
+    Enabled = true,
+    KeyboardKeyCode = { Name = "E", Value = 101 },
+    HoldDuration = 0,
+    MaxActivationDistance = 10,
+  })
+  return { inst = prompt, anchor = anchor, pos = Vector3.new(0, 0, 0) }
+end
+
+-- run one Act.prompt with a controlled service and press
+local function runWatched(p, onPress, preset)
+  local savedWatching, savedActive = Act.watching, Act.active
+  local savedTriggered, savedAt = Act.lastTriggered, Act.triggeredAt
+  local savedHold = Input.hold
+  local savedLook = RR.Move.lookAt
+
+  Act.watching = true
+  Act.active = p.inst
+  Act.lastTriggered = nil
+  Act.triggeredAt = nil
+  if preset then preset() end
+  RR.Move.lookAt = function() return true end
+  Input.hold = function()
+    if onPress then onPress() end
+    return true
+  end
+
+  local ok, how = Act.prompt(p, {})
+
+  Act.watching = savedWatching
+  Act.active = savedActive
+  Act.lastTriggered = savedTriggered
+  Act.triggeredAt = savedAt
+  Input.hold = savedHold
+  RR.Move.lookAt = savedLook
+
+  return ok, how
+end
+
+check("a trigger caused by the press is success", function()
+  local p = fakePrompt()
+  local ok, how = runWatched(p, function()
+    Act.lastTriggered = p.inst
+    Act.triggeredAt = tick()
+  end)
+  eq(ok, true, "confirmed")
+  eq(how, "triggered", "method")
+end)
+
+check("a press with no trigger is a failure", function()
+  local p = fakePrompt()
+  local ok, why = runWatched(p, nil)
+  eq(ok, false, "unconfirmed")
+  if not string.find(tostring(why), "did not trigger", 1, true) then
+    error("wrong reason: " .. tostring(why))
+  end
+end)
+
+check("a trigger left over from a previous press does not count", function()
+  local p = fakePrompt()
+  local ok = runWatched(p, nil, function()
+    Act.lastTriggered = p.inst
+    Act.triggeredAt = tick() - 30
+  end)
+  eq(ok, false, "stale trigger rejected")
+end)
+
+check("the wrong prompt being active blocks the press", function()
+  local p = fakePrompt()
+  local savedWatching, savedActive = Act.watching, Act.active
+  local savedLook = RR.Move.lookAt
+  local savedHold = Input.hold
+
+  Act.watching = true
+  Act.active = { tag = "someone else" }
+  RR.Move.lookAt = function() return true end
+  local pressed = false
+  Input.hold = function() pressed = true return true end
+
+  local ok, why = Act.prompt(p, {})
+
+  Act.watching = savedWatching
+  Act.active = savedActive
+  RR.Move.lookAt = savedLook
+  Input.hold = savedHold
+
+  eq(ok, false, "refused")
+  eq(pressed, false, "no key was sent")
+  if not string.find(tostring(why), "not the active prompt", 1, true) then
+    error("wrong reason: " .. tostring(why))
+  end
+end)
+
+-- ---------------------------------------------------------------------
+-- 10. stats surface
 -- ---------------------------------------------------------------------
 describe("summaries are safe to render before anything ran")
 
